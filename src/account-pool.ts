@@ -908,11 +908,13 @@ export async function selectAccount(
 
   const redis = getRedis()
   const bindingKey = sessionId ? `sess:${sessionId}` : clientId ? `sess:client:${clientId}` : null
+  log('info', `sticky.select start key=${bindingKey ?? '-'} session=${sessionId ?? '-'} client=${clientId ?? '-'} model=${model ?? '-'} client_group=${clientGroupId ?? '-'} local_accounts=${accounts.length}`)
 
   // 1. Check existing binding
   if (bindingKey) {
     const binding = await readBinding(redis, bindingKey)
     if (binding) {
+      log('info', `sticky.binding found key=${bindingKey} account=${binding.accountId} overflow=${binding.overflowCount}`)
       const account = accounts.find(a => a.id === binding.accountId)
 
       if (account) {
@@ -921,6 +923,7 @@ export async function selectAccount(
         if (!isAccountInGroup(account, clientGroupId)) {
           const picked = await pickBestAccount(model, [account.id], clientGroupId)
           if (!picked) return null
+          log('warn', `sticky.binding migrate group_mismatch key=${bindingKey} from=${account.id} to=${picked.account.id} client_group=${clientGroupId ?? '-'}`)
           await moveBindingToAccount(redis, bindingKey, binding, account.id, picked.account)
           return { account: picked.account, isOverflow: false, selectedGroupId: picked.selectedGroupId }
         }
@@ -928,6 +931,7 @@ export async function selectAccount(
         if (!isModelAllowedForAccountType(model, account.accountType)) {
           const picked = await pickBestAccount(model, [account.id], clientGroupId)
           if (!picked) return null
+          log('warn', `sticky.binding overflow model_not_allowed key=${bindingKey} bound=${account.id} picked=${picked.account.id} model=${model ?? '-'} account_type=${account.accountType}`)
           await redis.expire(bindingKey, ttl)
           return { account: picked.account, isOverflow: true, selectedGroupId: picked.selectedGroupId }
         }
@@ -940,12 +944,14 @@ export async function selectAccount(
             await writeBinding(redis, bindingKey, binding, ttl)
           }
           const eff = resolveEffectiveGroup(account, clientGroupId)
+          log('info', `sticky.binding reuse key=${bindingKey} account=${account.id} selected_group=${eff.groupId ?? '-'}`)
           return { account, isOverflow: false, selectedGroupId: eff.groupId }
         }
 
         if (account.status !== 'active') {
           const picked = await pickBestAccount(model, [account.id], clientGroupId)
           if (!picked) return null
+          log('warn', `sticky.binding migrate inactive key=${bindingKey} from=${account.id} to=${picked.account.id} status=${account.status}`)
           await moveBindingToAccount(redis, bindingKey, binding, account.id, picked.account)
           return { account: picked.account, isOverflow: false, selectedGroupId: picked.selectedGroupId }
         }
@@ -960,13 +966,16 @@ export async function selectAccount(
         // 池子空场景下行为不变(都是 binding 保留 + 503)。
         const newPicked = await pickBestAccount(model, [account.id], clientGroupId)
         if (newPicked) {
+          log('warn', `sticky.binding migrate unusable key=${bindingKey} from=${account.id} to=${newPicked.account.id} status=${account.status} model=${model ?? '-'}`)
           await moveBindingToAccount(redis, bindingKey, binding, account.id, newPicked.account)
           return { account: newPicked.account, isOverflow: false, selectedGroupId: newPicked.selectedGroupId }
         }
         // 实在没号可用,只能 503 — binding 不动,等下次重新挑
+        log('warn', `sticky.binding unusable_no_fallback key=${bindingKey} account=${account.id} status=${account.status} model=${model ?? '-'}`)
         await redis.expire(bindingKey, ttl)
         return null
       }
+      log('warn', `sticky.binding account_missing key=${bindingKey} bound_account=${binding.accountId} local_accounts=${accounts.length}`)
     }
   }
 
@@ -976,6 +985,7 @@ export async function selectAccount(
   const account = picked.account
 
   if (bindingKey) {
+    log('info', `sticky.binding create key=${bindingKey} account=${account.id} selected_group=${picked.selectedGroupId ?? '-'}`)
     await createBinding(redis, bindingKey, account)
   }
 
