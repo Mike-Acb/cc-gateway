@@ -9,7 +9,14 @@ import { getUpstreamAuthMode } from './config.js'
 import { authenticate, initAuth, type AuthResult } from './auth.js'
 import { getAccessToken } from './oauth.js'
 import { rewriteBody, rewriteHeaders, getLockedVersion, deriveFallbackSessionId, type RewriteOptions } from './rewriter.js'
-import { MissingTemplateRedisError, NonCCRequestError, NoTemplateBoundError, validateThinkingParams, capBodyCacheControl, normalizeCacheControlTtlOrder } from './cc-disguise.js'
+import {
+  MissingTemplateRedisError,
+  NonCCRequestError,
+  NoTemplateBoundError,
+  validateThinkingParams,
+  capBodyCacheControl,
+  normalizeCacheControlTtlOrder,
+} from './cc-disguise.js'
 import { createToolNameReverseTransform } from './sse-tool-name-transform.js'
 import { buildEffectiveProfile, extractStickyId } from './identity-rewrite.js'
 import { getOrAssignSession } from './session-slots.js'
@@ -55,6 +62,14 @@ import { run as runFeaturePipeline } from './pipeline/runner.js'
 import { createPipelineContext } from './pipeline/context.js'
 import { bodyHasCacheControl, inferIsAgenticQuery } from './cc-betas.js'
 import { matchHeartbeat, buildHeartbeatJsonBody, writeHeartbeatStream } from './heartbeat.js'
+import {
+  createSSEUsageBillableTransformForResponse,
+  rewriteJSONUsageForBillableResponseBuffer,
+} from './response-usage.js'
+import {
+  resolveBillableExclusionPreflight,
+  resolveBillableUsageForRecord,
+} from './billable-exclusion-runtime.js'
 import {
   noteInvalidSignatureContext,
   noteSuccessfulSignatureContext,
@@ -1685,6 +1700,19 @@ async function forwardToUpstream(
   log('debug', `Outbound request headers [retry=${retryCount}] [account=${selectedAccount?.account.name ?? '-'} (${selectedAccount?.account.accountType ?? '-'})]: ${JSON.stringify(headers, null, 2)}`)
   log('debug', `Outbound request body [retry=${retryCount}] (${body.length} bytes): ${summarizeBody(body)}`)
 
+  const preflightBillableExclusion = await resolveBillableExclusionPreflight({
+    shouldMeter,
+    path,
+    accountAuthKind: selectedAccount?.account.authKind,
+    templateId: selectedAccount?.account.ccTemplateId,
+    requestModel,
+    outboundBody: body,
+    upstream: effectiveUpstream,
+    headers,
+    agent: selection.agent,
+    traceId,
+  })
+
   // ── Synthetic event emission (pre-request) ──
   const requestStartMs = Date.now()
   if (shouldMeter && selectedAccount?.account && oauthToken) {
@@ -2165,6 +2193,12 @@ async function forwardToUpstream(
               log('info', `Retry ${retryCount + 1}/${maxRetries}: switching to account "${newSelection.account.name}" (${newSelection.account.id}) after ${status}`)
               const newAccountId = newSelection.account.id
               await onRequestStart(newAccountId)
+              if (!res.headersSent) {
+                res.setHeader('x-ccg-selected-account-id', newSelection.account.id)
+                res.setHeader('x-ccg-selected-account-name', encodeURIComponent(newSelection.account.name))
+                res.setHeader('x-ccg-selected-auth-kind', newSelection.account.authKind)
+                res.setHeader('x-ccg-selection-mode', 'pool-retry')
+              }
 
               await forwardToUpstream(
                 req, res, config, upstream, method, path, rawBody, newCredential,
@@ -2191,8 +2225,9 @@ async function forwardToUpstream(
 
         const responseHeaders = { ...proxyRes.headers }
         delete responseHeaders['transfer-encoding']
-
-        res.writeHead(status, responseHeaders)
+        const contentType = proxyRes.headers['content-type'] || ''
+        const isSSE = contentType.includes('text/event-stream')
+        const responseEncoding = proxyRes.headers['content-encoding'] || ''
 
         // Stream-error handler shared by metering / non-metering paths.
         // 没这个 handler 时,上游 socket RST / Anthropic server abort 会让 'end' 永不触发,
@@ -2237,6 +2272,41 @@ async function forwardToUpstream(
           // Accumulate response for metering while streaming through
           const responseChunks: Buffer[] = []
           let firstTokenMs: number | null = null
+          const sseUsageTransform = createSSEUsageBillableTransformForResponse({
+            status,
+            isSSE,
+            responseEncoding,
+            preflight: preflightBillableExclusion,
+          })
+          const writeSSEOutput = (chunk: Buffer) => {
+            if (toolReverseTransform) {
+              toolReverseTransform.write(chunk)
+            } else {
+              res.write(chunk)
+            }
+          }
+          const endSSEOutput = () => {
+            if (toolReverseTransform) {
+              toolReverseTransform.end(() => { res.end() })
+            } else {
+              res.end()
+            }
+          }
+
+          if (isSSE) {
+            const streamingHeaders = { ...responseHeaders }
+            if (sseUsageTransform) {
+              delete streamingHeaders['content-length']
+              delete streamingHeaders['content-encoding']
+            }
+            res.writeHead(status, streamingHeaders)
+          }
+
+          if (sseUsageTransform) {
+            sseUsageTransform.on('data', writeSSEOutput)
+            sseUsageTransform.on('end', endSSEOutput)
+          }
+
           proxyRes.on('data', (chunk: Buffer) => {
             responseChunks.push(chunk)
             if (firstTokenMs === null) {
@@ -2250,95 +2320,123 @@ async function forwardToUpstream(
                 firstTokenMs = Date.now() - requestStart
               }
             }
-            if (toolReverseTransform) {
-              toolReverseTransform.write(chunk)
+            if (!isSSE) {
+              return
+            }
+            if (sseUsageTransform) {
+              sseUsageTransform.write(chunk)
             } else {
-              res.write(chunk)
+              writeSSEOutput(chunk)
             }
           })
           proxyRes.on('end', () => {
-            // 若挂了 transform — 先 end transform 触发 flush,再 res.end()
-            if (toolReverseTransform) {
-              toolReverseTransform.end(() => { res.end() })
-            } else {
-              res.end()
-            }
-            const latencyMs = Date.now() - requestStart
-            const encoding = proxyRes.headers['content-encoding'] || ''
-            const responseText = decodeResponseBody(
-              proxyRes.headers as Record<string, string | string[] | undefined>,
-              responseChunks,
-            )
-            const contentType = proxyRes.headers['content-type'] || ''
-            const isSSE = contentType.includes('text/event-stream')
-            log('debug', `Metering: content-type=${contentType}, encoding=${encoding}, isSSE=${isSSE}, bodyLen=${responseText.length}, first100=${responseText.slice(0, 100)}`)
-            const usage = isSSE
-              ? parseUsageFromSSE(responseText)
-              : parseUsageFromJSON(responseText)
-            log('debug', `Metering: parsed usage=${JSON.stringify(usage)}`)
-            if (usage) {
-              // Resolve the cost multiplier from the group the request was
-              // actually served on (auto-group selected at pickBestAccount time;
-              // static group when the client has group_id set; 1.0 for shared
-              // pool or the legacy single-token fallback).
-              const billingMultiplier = getGroupMultiplier(selectedAccount?.selectedGroupId ?? null)
-              const cost = calculateCost(usage, billingMultiplier)
+            void (async () => {
+              // 若挂了 transform,先 end transform 触发 flush,再结束响应。
+              if (isSSE && sseUsageTransform) {
+                sseUsageTransform.end()
+              } else if (isSSE) {
+                endSSEOutput()
+              }
+              const latencyMs = Date.now() - requestStart
+              const responseText = decodeResponseBody(
+                proxyRes.headers as Record<string, string | string[] | undefined>,
+                responseChunks,
+              )
+              log('debug', `Metering: content-type=${contentType}, encoding=${responseEncoding}, isSSE=${isSSE}, bodyLen=${responseText.length}, first100=${responseText.slice(0, 100)}`)
+              const usage = isSSE
+                ? parseUsageFromSSE(responseText)
+                : parseUsageFromJSON(responseText)
+              log('debug', `Metering: parsed usage=${JSON.stringify(usage)}`)
+              let excludedTokens = 0
+              if (usage) {
+                // Resolve the cost multiplier from the group the request was
+                // actually served on (auto-group selected at pickBestAccount time;
+                // static group when the client has group_id set; 1.0 for shared
+                // pool or the legacy single-token fallback).
+                const billingMultiplier = getGroupMultiplier(selectedAccount?.selectedGroupId ?? null)
+                const rawCost = calculateCost(usage, billingMultiplier)
 
-              // Sequence: deduct from subscription FIRST so we can capture the
-              // post-debit balance, then INSERT usage_records with that snapshot.
-              // Fire-and-forget: both run async, but chained so balance_after is
-              // accurate even if the user recharges later.
-              const cid = authResult.clientId
-              ;(async () => {
-                const balanceAfter = (planSubscriptionId && planType)
-                  ? await recordPlanUsage(planSubscriptionId, planType, cost, planPrebillUsd, new Date(requestStart))
-                  : null
-                const effectiveCid = cid || (await resolveConfigClientId(authResult.clientName).catch(() => null))
-                if (effectiveCid) {
-                  await recordUsage(
-                    effectiveCid, usage, path, status, latencyMs,
-                    accountId ?? undefined, planSubscriptionId, traceId,
-                    billingMultiplier, balanceAfter,
-                  )
-                }
-              })().catch(() => {})
-
-              // Emit synthetic tengu_api_success event
-              const emitCtx = (req as any).__emitCtx
-              const emitHints = (req as any).__emitHints ?? {}
-              if (emitCtx) {
-                const reqId = proxyRes.headers['request-id']
-                emitApiSuccess(emitCtx, {
-                  inputTokens: usage.inputTokens,
-                  outputTokens: usage.outputTokens,
-                  cachedInputTokens: usage.cacheRead,
-                  durationMs: latencyMs,
-                  requestId: typeof reqId === 'string' ? reqId : undefined,
-                  stopReason: 'end_turn',
-                  costUSD: cost,
-                  hasStructuredOutput: emitHints.hasStructuredOutput,
-                  hasToolSearch: emitHints.hasToolSearch,
-                  hasCacheControl: emitHints.hasCacheControl,
-                  isAgenticQuery: emitHints.isAgenticQuery,
+                // Sequence: deduct from subscription FIRST so we can capture the
+                // post-debit balance, then INSERT usage_records with that snapshot.
+                // Fire-and-forget: both run async, but chained so balance_after is
+                // accurate even if the user recharges later.
+                const cid = authResult.clientId
+                const billable = await resolveBillableUsageForRecord({
+                  accountAuthKind: selectedAccount?.account.authKind,
+                  templateId: selectedAccount?.account.ccTemplateId,
+                  usage,
+                  preflight: preflightBillableExclusion,
+                  outboundBody: body,
+                  upstream: effectiveUpstream,
+                  headers,
+                  agent: selection.agent,
+                  traceId,
                 })
-              }
+                excludedTokens = billable.excludedTokens
+                const billableUsage = billable.billableUsage
 
-              // Track account pool metrics
-              if (accountId) {
-                const totalTokens = usage.inputTokens + usage.outputTokens + usage.cacheRead + usage.cacheWrite
-                const retryAfterSec = status >= 400 ? parseRetryAfterSec(proxyRes.headers['retry-after']) : null
-                onRequestEnd(
-                  accountId,
-                  totalTokens,
-                  cost,
-                  status < 400,
-                  status < 400 ? null : (upstream429Reason ?? extractUpstreamFailureReason(status, responseText)),
-                  retryAfterSec,
-                ).catch(() => {})
-              }
+                if (!isSSE) {
+                  const rewritten = rewriteJSONUsageForBillableResponseBuffer(responseText, responseHeaders, excludedTokens)
+                  if (rewritten) {
+                    res.writeHead(status, rewritten.headers)
+                    res.end(rewritten.body)
+                  } else {
+                    res.writeHead(status, responseHeaders)
+                    res.end(Buffer.concat(responseChunks))
+                  }
+                }
 
-              // (recordPlanUsage was moved above into the sequenced
-              //  recordUsage block so balance_after can be snapshotted.)
+                ;(async () => {
+                  const billableCost = calculateCost(billableUsage, billingMultiplier)
+                  const balanceAfter = (planSubscriptionId && planType)
+                    ? await recordPlanUsage(planSubscriptionId, planType, billableCost, planPrebillUsd, new Date(requestStart))
+                    : null
+                  const effectiveCid = cid || (await resolveConfigClientId(authResult.clientName).catch(() => null))
+                  if (effectiveCid) {
+                    await recordUsage(
+                      effectiveCid, billableUsage, path, status, latencyMs,
+                      accountId ?? undefined, planSubscriptionId, traceId,
+                      billingMultiplier, balanceAfter,
+                    )
+                  }
+                })().catch(() => {})
+
+                // Emit synthetic tengu_api_success event
+                const emitCtx = (req as any).__emitCtx
+                const emitHints = (req as any).__emitHints ?? {}
+                if (emitCtx) {
+                  const reqId = proxyRes.headers['request-id']
+                  emitApiSuccess(emitCtx, {
+                    inputTokens: usage.inputTokens,
+                    outputTokens: usage.outputTokens,
+                    cachedInputTokens: usage.cacheRead,
+                    durationMs: latencyMs,
+                    requestId: typeof reqId === 'string' ? reqId : undefined,
+                    stopReason: 'end_turn',
+                    costUSD: rawCost,
+                    hasStructuredOutput: emitHints.hasStructuredOutput,
+                    hasToolSearch: emitHints.hasToolSearch,
+                    hasCacheControl: emitHints.hasCacheControl,
+                    isAgenticQuery: emitHints.isAgenticQuery,
+                  })
+                }
+
+                // Track account pool metrics
+                if (accountId) {
+                  const totalTokens = usage.inputTokens + usage.outputTokens + usage.cacheRead + usage.cacheWrite
+                  const retryAfterSec = status >= 400 ? parseRetryAfterSec(proxyRes.headers['retry-after']) : null
+                  onRequestEnd(
+                    accountId,
+                    totalTokens,
+                    rawCost,
+                    status < 400,
+                    status < 400 ? null : (upstream429Reason ?? extractUpstreamFailureReason(status, responseText)),
+                    retryAfterSec,
+                  ).catch(() => {})
+                }
+
+                // (recordPlanUsage was moved above into the sequenced
+                //  recordUsage block so balance_after can be snapshotted.)
             } else {
               // No usage parsed but still need to end account tracking
               if (accountId) {
@@ -2360,6 +2458,10 @@ async function forwardToUpstream(
                   'UPDATE subscriptions SET balance = balance + $1, updated_at = now() WHERE id = $2',
                   [planPrebillUsd, planSubscriptionId],
                 ).catch(() => {})
+              }
+              if (!isSSE) {
+                res.writeHead(status, responseHeaders)
+                res.end(Buffer.concat(responseChunks))
               }
             }
             const responseBodyTruncated = truncateBody(Buffer.from(responseText))
@@ -2387,10 +2489,21 @@ async function forwardToUpstream(
               blockSource: upstreamBlockReason ? 'up' : null,
             }).catch(() => {})
             resolveRequest()
+            })().catch((err) => {
+              log('error', `Metering response handling failed [trace=${traceId}]: ${err?.message ?? String(err)}`)
+              if (!res.headersSent) {
+                res.writeHead(status, responseHeaders)
+                res.end(Buffer.concat(responseChunks))
+              } else if (!res.writableEnded) {
+                res.end()
+              }
+              resolveRequest()
+            })
           })
         } else {
           // Stream response directly (non-messages endpoints)
           // toolReverseTransform 不会命中(非 messages 路径没 tool_use),直接 pipe
+          res.writeHead(status, responseHeaders)
           proxyRes.pipe(res)
           proxyRes.on('end', () => {
             // End account tracking for non-metered requests

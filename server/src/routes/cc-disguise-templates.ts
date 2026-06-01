@@ -3,6 +3,7 @@ import { query, DEPLOYMENT } from '../db.js'
 import { authMiddleware } from '../middleware/auth.js'
 import { adminMiddleware } from '../middleware/admin.js'
 import { audit } from '../services/audit.js'
+import { getRedis } from '../redis.js'
 
 const router = Router()
 
@@ -29,6 +30,24 @@ async function notifyReload(): Promise<void> {
 }
 
 type ToolLike = { name?: unknown } | unknown
+type BillableExcludedByModel = Record<string, number>
+
+function normalizeBillableExcludedModel(model: string): string {
+  return model.replace(/-\d{8}$/, '')
+}
+
+function billableExcludedTokensRedisKey(templateId: string, model: string): string {
+  return `cc_disguise_template_billable_excluded:${DEPLOYMENT}:${templateId}:${normalizeBillableExcludedModel(model)}`
+}
+
+function billableExcludedTokensRedisPattern(templateId: string): string {
+  return `cc_disguise_template_billable_excluded:${DEPLOYMENT}:${templateId}:*`
+}
+
+function modelFromBillableExcludedTokensRedisKey(templateId: string, key: string): string {
+  const prefix = `cc_disguise_template_billable_excluded:${DEPLOYMENT}:${templateId}:`
+  return normalizeBillableExcludedModel(key.startsWith(prefix) ? key.slice(prefix.length) : key)
+}
 
 function validateTools(tools: unknown, requireCCBaseline: boolean): { ok: true; normalized: any[] } | { ok: false; error: string } {
   if (!Array.isArray(tools)) return { ok: false, error: 'tools must be an array' }
@@ -66,6 +85,59 @@ function validateSystemBlocks(blocks: unknown): { ok: true; normalized: any[] } 
   return { ok: true, normalized: cleaned }
 }
 
+function parseBillableExcludedTokensByModel(value: unknown): { ok: true; value: BillableExcludedByModel } | { ok: false; error: string } {
+  if (value === undefined || value === null || value === '') return { ok: true, value: {} }
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return { ok: false, error: 'billable_excluded_tokens_by_model must be an object of model -> non-negative integer' }
+  }
+  const out: BillableExcludedByModel = {}
+  for (const [rawModel, rawTokens] of Object.entries(value as Record<string, unknown>)) {
+    const model = normalizeBillableExcludedModel(rawModel.trim())
+    if (!model) return { ok: false, error: 'billable_excluded_tokens_by_model contains an empty model key' }
+    const n = Number(rawTokens)
+    if (!Number.isInteger(n) || n < 0) {
+      return { ok: false, error: `billable_excluded_tokens_by_model.${model} must be a non-negative integer` }
+    }
+    if (n > 0) out[model] = n
+  }
+  return { ok: true, value: out }
+}
+
+async function readBillableExcludedTokensByModel(templateId: string): Promise<BillableExcludedByModel> {
+  const redis = getRedis()
+  if (!redis) return {}
+  const keys = await redis.keys(billableExcludedTokensRedisPattern(templateId))
+  if (keys.length === 0) return {}
+  const values = await redis.mget(keys)
+  const out: BillableExcludedByModel = {}
+  keys.forEach((key, idx) => {
+    const n = Number(values[idx] ?? 0)
+    if (Number.isFinite(n) && n > 0) {
+      out[modelFromBillableExcludedTokensRedisKey(templateId, key)] = Math.floor(n)
+    }
+  })
+  return out
+}
+
+async function replaceBillableExcludedTokensByModel(templateId: string, values: BillableExcludedByModel): Promise<void> {
+  const redis = getRedis()
+  if (!redis) throw new Error('Redis unavailable')
+  const existing = await redis.keys(billableExcludedTokensRedisPattern(templateId))
+  const pipe = redis.pipeline()
+  for (const key of existing) pipe.del(key)
+  for (const [model, tokens] of Object.entries(values)) {
+    if (tokens > 0) pipe.set(billableExcludedTokensRedisKey(templateId, model), String(tokens))
+  }
+  await pipe.exec()
+}
+
+async function cloneBillableExcludedTokensByModel(sourceTemplateId: string, targetTemplateId: string): Promise<void> {
+  const values = await readBillableExcludedTokensByModel(sourceTemplateId)
+  if (Object.keys(values).length > 0) {
+    await replaceBillableExcludedTokensByModel(targetTemplateId, values)
+  }
+}
+
 // GET /api/admin/cc-disguise-templates — list with used_by counts
 router.get('/', async (_req, res) => {
   try {
@@ -88,7 +160,7 @@ router.get('/', async (_req, res) => {
       [DEPLOYMENT],
     )
 
-    const items = result.rows.map((r: any) => {
+    const items = await Promise.all(result.rows.map(async (r: any) => {
       const tools = Array.isArray(r.tools) ? r.tools : []
       const systemBlocks = Array.isArray(r.system_blocks) ? r.system_blocks : []
       return {
@@ -97,6 +169,7 @@ router.get('/', async (_req, res) => {
         description: r.description,
         source: r.source,
         source_ua: r.source_ua,
+        billable_excluded_tokens_by_model: await readBillableExcludedTokensByModel(r.id),
         is_default: !!r.is_default,
         tools_count: tools.length,
         tool_names: tools.map((t: any) => t?.name ?? t).filter(Boolean),
@@ -107,7 +180,7 @@ router.get('/', async (_req, res) => {
         created_at: r.created_at,
         updated_at: r.updated_at,
       }
-    })
+    }))
 
     res.json({ items })
   } catch (err: any) {
@@ -141,6 +214,7 @@ router.get('/:id', async (req, res) => {
 
     res.json({
       ...t,
+      billable_excluded_tokens_by_model: await readBillableExcludedTokensByModel(t.id),
       bound_accounts: bound.rows,
     })
   } catch (err: any) {
@@ -159,6 +233,8 @@ router.post('/', async (req, res) => {
     const source_ua = typeof body.source_ua === 'string' ? body.source_ua : null
     const rawSource = typeof body.source === 'string' ? body.source : 'manual'
     const source = ['manual', 'cloned', 'imported'].includes(rawSource) ? rawSource : 'manual'
+    const ev = parseBillableExcludedTokensByModel(body.billable_excluded_tokens_by_model)
+    if (!ev.ok) { res.status(400).json({ error: ev.error }); return }
 
     const tv = validateTools(body.tools, true)
     if (!tv.ok) { res.status(400).json({ error: tv.error }); return }
@@ -174,6 +250,9 @@ router.post('/', async (req, res) => {
         JSON.stringify(sv.normalized), source, source_ua],
     )
     const row = inserted.rows[0]
+    if (Object.keys(ev.value).length > 0) {
+      await replaceBillableExcludedTokensByModel(row.id, ev.value)
+    }
 
     await audit(req, {
       action: 'cc_disguise_template.create',
@@ -226,6 +305,12 @@ router.patch('/:id', async (req, res) => {
       updates.push(`source_ua = $${values.length + 1}`)
       values.push(typeof body.source_ua === 'string' ? body.source_ua : null)
     }
+    let billableExcludedTokensByModel: BillableExcludedByModel | null = null
+    if (body.billable_excluded_tokens_by_model !== undefined) {
+      const ev = parseBillableExcludedTokensByModel(body.billable_excluded_tokens_by_model)
+      if (!ev.ok) { res.status(400).json({ error: ev.error }); return }
+      billableExcludedTokensByModel = ev.value
+    }
     if (body.tools !== undefined) {
       const tv = validateTools(body.tools, true)
       if (!tv.ok) { res.status(400).json({ error: tv.error }); return }
@@ -239,30 +324,39 @@ router.patch('/:id', async (req, res) => {
       values.push(JSON.stringify(sv.normalized))
     }
 
-    if (updates.length === 0) {
+    if (updates.length === 0 && billableExcludedTokensByModel === null) {
       res.status(400).json({ error: 'no updatable fields provided' })
       return
     }
 
-    updates.push(`updated_at = now()`)
-    values.push(req.params.id)
-    values.push(DEPLOYMENT)
+    let after = before
+    if (updates.length > 0) {
+      updates.push(`updated_at = now()`)
+      values.push(req.params.id)
+      values.push(DEPLOYMENT)
 
-    const updated = await query(
-      `UPDATE cc_disguise_templates
-          SET ${updates.join(', ')}
-        WHERE id = $${values.length - 1} AND deployment = $${values.length}
-        RETURNING *`,
-      values,
-    )
-    const after = updated.rows[0]
+      const updated = await query(
+        `UPDATE cc_disguise_templates
+            SET ${updates.join(', ')}
+          WHERE id = $${values.length - 1} AND deployment = $${values.length}
+          RETURNING *`,
+        values,
+      )
+      after = updated.rows[0]
+    }
+    if (billableExcludedTokensByModel !== null) {
+      await replaceBillableExcludedTokensByModel(req.params.id, billableExcludedTokensByModel)
+    }
+
+    const afterBillableExcludedTokensByModel = billableExcludedTokensByModel
+      ?? await readBillableExcludedTokensByModel(after.id)
 
     await audit(req, {
       action: 'cc_disguise_template.update',
       resource_type: 'cc_disguise_template',
       resource_id: after.id,
       before: { name: before.name, source: before.source, tools_count: (before.tools ?? []).length },
-      after: { name: after.name, source: after.source, tools_count: (after.tools ?? []).length },
+      after: { name: after.name, source: after.source, tools_count: (after.tools ?? []).length, billable_excluded_tokens_by_model: afterBillableExcludedTokensByModel },
       summary: `template ${after.name} updated`,
     })
 
@@ -312,6 +406,7 @@ router.post('/:id/clone', async (req, res) => {
         JSON.stringify(s.system_blocks ?? []), s.source_ua],
     )
     const row = inserted.rows[0]
+    await cloneBillableExcludedTokensByModel(s.id, row.id)
 
     await audit(req, {
       action: 'cc_disguise_template.clone',

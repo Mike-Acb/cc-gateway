@@ -10,6 +10,23 @@ export type UsageData = {
   cacheWrite: number
 }
 
+export function applyBillableExclusion(usage: UsageData, excludedTokens: number): UsageData {
+  const billable: UsageData = { ...usage }
+  let remaining = Math.max(0, Math.floor(Number.isFinite(excludedTokens) ? excludedTokens : 0))
+
+  const deduct = (key: 'cacheWrite' | 'cacheRead') => {
+    if (remaining <= 0) return
+    const n = Math.min(billable[key], remaining)
+    billable[key] -= n
+    remaining -= n
+  }
+
+  deduct('cacheWrite')
+  deduct('cacheRead')
+
+  return billable
+}
+
 export function calculateCost(usage: UsageData, multiplier = 1): number {
   const price = findModelPrice(usage.model)
   if (!price) {
