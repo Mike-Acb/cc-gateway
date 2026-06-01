@@ -1,0 +1,32 @@
+@import "tailwindcss";
+@import './ui/tokens.css';
+
+/* Apple HIG Design Tokens */
+:root {
+  --color-blue: #007aff;
+  --color-green: #34c759;
+  --color-orange: #ff9500;
+  --color-purple: #af52de;
+  --color-red: #ff3b30;
+  --color-gray-1: #1d1d1f;
+  --color-gray-2: #6e6e73;
+  --color-gray-3: #86868b;
+  --color-gray-4: #c7c7cc;
+  --color-gray-5: #d2d2d7;
+  --color-gray-6: #e8e8ed;
+  --color-bg: #f5f5f7;
+  --color-card: #ffffff;
+  --color-sidebar: #fafafa;
+}
+
+.recharts-wrapper *:focus,
+.recharts-wrapper *:focus-visible {
+  outline: none !important;
+}
+
+body {
+  font-family: -apple-system, 'SF Pro Text', 'Inter', system-ui, sans-serif;
+  background: var(--color-bg);
+  color: var(--color-gray-1);
+  -webkit-font-smoothing: antialiased;
+}

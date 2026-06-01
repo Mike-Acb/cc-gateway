@@ -1,0 +1,39 @@
+# CC Gateway - Clash Rules Template
+#
+# Add these rules to your ClashX/Clash Verge config.
+# Purpose: Block all direct connections from client machines to Anthropic.
+# Only the gateway server should be able to reach Anthropic.
+#
+# How to use:
+#   1. Open ClashX → Config → Edit config
+#   2. Add these rules BEFORE your existing rules (order matters)
+#   3. Replace gateway.office.com with your actual gateway domain/IP
+
+# === Add to your 'rules' section ===
+
+rules:
+  # Allow connection to the gateway itself
+  - DOMAIN,gateway.office.com,DIRECT
+
+  # Block all direct connections to Anthropic services
+  - DOMAIN-SUFFIX,anthropic.com,REJECT
+  - DOMAIN-SUFFIX,claude.com,REJECT
+  - DOMAIN-SUFFIX,claude.ai,REJECT
+
+  # Block telemetry (backup - env var should already disable this)
+  - DOMAIN-SUFFIX,datadoghq.com,REJECT
+
+  # Block update checks (backup)
+  - DOMAIN,storage.googleapis.com,REJECT
+
+  # ... your other rules below ...
+  # - MATCH,DIRECT
+
+# === Notes ===
+#
+# If you see Claude Code errors like "connection refused" or "ECONNREFUSED",
+# it means Clash is correctly blocking a direct connection attempt.
+# This is GOOD - it means you caught a leak that env vars didn't prevent.
+#
+# To debug: switch the REJECT rules to DIRECT temporarily, check which
+# domain CC is trying to reach, then update the gateway to handle it.

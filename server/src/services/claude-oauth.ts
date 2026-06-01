@@ -1,0 +1,505 @@
+// Self-contained Anthropic OAuth flow that converts a claude.ai sessionKey
+// (`sk-ant-sid02-...`) into a full OAuth credential pair (access_token +
+// refresh_token), eliminating the cc-bridge dependency for CK import.
+//
+// Flow (verbatim port of cc-bridge oauth_flow.rs):
+//   1. GET https://claude.ai/api/organizations  (Cookie: sessionKey)        <- curl-impersonate (CF)
+//      -> pick org_uuid + derive subscription_type from rate_limit_tier + capabilities
+//   2. PKCE: code_verifier (32 random bytes, base64url) + code_challenge (SHA256, base64url)
+//   3. POST https://claude.ai/v1/oauth/{org}/authorize  (Cookie: sessionKey) <- curl-impersonate (CF)
+//      -> server returns redirect_uri with `?code=...&state=...`
+//   4. POST https://platform.claude.com/v1/oauth/token  grant_type=authorization_code  <- plain Node
+//      -> returns access_token, refresh_token, expires_in, organization, account
+//
+// Steps 1 + 3 go through claude.ai which is Cloudflare-protected — Node.js
+// default TLS triggers the CF JA3 bot check. We delegate those to the
+// curl-impersonate binary (statically installed in the server image) which
+// emulates Chrome 120's TLS fingerprint. Step 4 hits platform.claude.com
+// which is NOT CF-fronted, so cc-gateway's standard https.request stack
+// continues to work there (same as the existing src/oauth.ts refresh path).
+
+import { randomBytes, createHash } from 'crypto'
+import { spawn } from 'child_process'
+import { requestExternal, resolveProxyUrl } from './outbound-proxy.js'
+
+/**
+ * Accept user-pasted proxy strings in any of these shapes and return a URL
+ * that curl-impersonate's --proxy understands:
+ *   user:pass@host:port           -> http://user:pass@host:port
+ *   host:port                     -> http://host:port
+ *   http(s)://user:pass@host:port -> unchanged
+ *   socks5://user:pass@host:port  -> unchanged
+ * Empty / whitespace input returns null.
+ */
+function normalizeProxyUrl(raw: string | null | undefined): string | null {
+  if (!raw) return null
+  const trimmed = raw.trim()
+  if (!trimmed) return null
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(trimmed)) return trimmed
+  return `http://${trimmed}`
+}
+
+const CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e'
+const AUTHORIZE_API_URL = 'https://claude.ai/v1/oauth/{org}/authorize'
+const TOKEN_URL = 'https://platform.claude.com/v1/oauth/token'
+const REDIRECT_URI = 'https://platform.claude.com/oauth/code/callback'
+const ORGANIZATIONS_URL = 'https://claude.ai/api/organizations'
+
+// curl-impersonate binary: shipped with the server image (see Dockerfile.server).
+// chrome116 is the latest Chrome version available in curl-impersonate v0.6.1.
+// Set CURL_IMPERSONATE_BIN env var to override (e.g. /usr/local/bin/curl_ff117).
+const CURL_IMPERSONATE_BIN = process.env.CURL_IMPERSONATE_BIN ?? '/usr/local/bin/curl_chrome116'
+
+// Full scope set used by Claude Code clients
+const SCOPE_FULL =
+  'user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload'
+
+// ---------------------------------------------------------------------------
+// PKCE helpers
+// ---------------------------------------------------------------------------
+
+function base64url(buf: Buffer): string {
+  return buf
+    .toString('base64')
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=+$/, '')
+}
+
+function generateState(): string {
+  return base64url(randomBytes(32))
+}
+function generateCodeVerifier(): string {
+  return base64url(randomBytes(32))
+}
+function generateCodeChallenge(verifier: string): string {
+  return base64url(createHash('sha256').update(verifier).digest())
+}
+
+// ---------------------------------------------------------------------------
+// curl-impersonate subprocess wrapper
+// ---------------------------------------------------------------------------
+
+type CurlResponse = {
+  statusCode: number
+  headers: Record<string, string>
+  text: string
+}
+
+/**
+ * Issue an HTTPS request via curl-impersonate (Chrome TLS fingerprint).
+ * Used for CF-fronted endpoints on claude.ai. Outbound proxy is passed as a
+ * raw URL through `--proxy` so SOCKS5 / HTTP / HTTPS proxies all work.
+ *
+ * We use `--write-out HTTP_STATUS=%{http_code}` on a separate line, then
+ * `--include` to dump response headers; this lets us recover the status code
+ * + headers without depending on curl-impersonate's libcurl version exposing
+ * structured output.
+ */
+async function curlImpersonateRequest(opts: {
+  url: string
+  method: 'GET' | 'POST'
+  headers?: Record<string, string>
+  body?: string
+  proxyUrl?: string | null
+  timeoutMs?: number
+}): Promise<CurlResponse> {
+  const args: string[] = [
+    '-s', // silent (no progress)
+    '-i', // include response headers in output
+    '--max-time', String(Math.ceil((opts.timeoutMs ?? 20_000) / 1000)),
+  ]
+  if (opts.proxyUrl) {
+    args.push('--proxy', opts.proxyUrl)
+  }
+  args.push('-X', opts.method)
+  for (const [k, v] of Object.entries(opts.headers ?? {})) {
+    args.push('-H', `${k}: ${v}`)
+  }
+  if (opts.body) {
+    args.push('--data-raw', opts.body)
+  }
+  args.push(opts.url)
+
+  return new Promise((resolve, reject) => {
+    const proc = spawn(CURL_IMPERSONATE_BIN, args, { stdio: ['ignore', 'pipe', 'pipe'] })
+    const stdoutChunks: Buffer[] = []
+    const stderrChunks: Buffer[] = []
+    proc.stdout.on('data', (c) => stdoutChunks.push(c))
+    proc.stderr.on('data', (c) => stderrChunks.push(c))
+    proc.on('error', (err) => reject(new Error(`curl-impersonate spawn failed: ${err.message}`)))
+    proc.on('close', (code) => {
+      if (code !== 0) {
+        const stderr = Buffer.concat(stderrChunks).toString('utf-8').trim()
+        reject(new Error(`curl-impersonate exit ${code}: ${stderr.slice(0, 200)}`))
+        return
+      }
+      const raw = Buffer.concat(stdoutChunks).toString('utf-8')
+      // Find the first empty line — separator between headers and body.
+      // curl may emit multiple header blocks (redirects), keep the last one.
+      const blocks: string[] = []
+      let cursor = 0
+      while (cursor < raw.length) {
+        const sep = raw.indexOf('\r\n\r\n', cursor)
+        if (sep < 0) break
+        blocks.push(raw.slice(cursor, sep))
+        cursor = sep + 4
+        // Probe if the next block is another set of headers (starts with "HTTP/")
+        if (!raw.slice(cursor, cursor + 5).startsWith('HTTP/')) break
+      }
+      const lastHeaderBlock = blocks[blocks.length - 1] ?? ''
+      const body = raw.slice(cursor)
+      const headerLines = lastHeaderBlock.split('\r\n')
+      const statusLine = headerLines[0] ?? 'HTTP/1.1 0 unknown'
+      const statusMatch = statusLine.match(/^HTTP\/[\d.]+\s+(\d+)/)
+      const statusCode = statusMatch ? Number(statusMatch[1]) : 0
+      const headers: Record<string, string> = {}
+      for (let i = 1; i < headerLines.length; i++) {
+        const line = headerLines[i]
+        const colon = line.indexOf(':')
+        if (colon < 0) continue
+        const name = line.slice(0, colon).trim().toLowerCase()
+        const value = line.slice(colon + 1).trim()
+        headers[name] = value
+      }
+      resolve({ statusCode, headers, text: body })
+    })
+  })
+}
+
+// ---------------------------------------------------------------------------
+// Subscription tier normalization
+// ---------------------------------------------------------------------------
+
+/**
+ * Map Anthropic's organization metadata (rate_limit_tier + capabilities) to
+ * the stable subscription IDs cc-gateway uses: pro / max5 / max20 / free.
+ * Verbatim port of cc-bridge `normalize_claude_rate_limit_tier`.
+ *
+ * Decision order (capabilities take precedence over raw tier):
+ *   1. capabilities contains "claude_max" → max20 / max5 based on tier suffix
+ *   2. capabilities contains "claude_pro"  → pro
+ *   3. fallback: pattern-match the tier string
+ *   4. nothing matched → return raw lowercase tier (don't guess)
+ */
+export function normalizeSubscriptionTier(tier: string, capabilities: string[]): string {
+  const t = (tier || '').trim().toLowerCase()
+  const caps = capabilities.map((c) => c.trim().toLowerCase())
+  const hasMax = caps.includes('claude_max')
+  const hasPro = caps.includes('claude_pro')
+
+  const looksMax20 = t.includes('max_20x') || t.includes('max_20') || t.includes('max20')
+  const looksMax5 = t.includes('max_5x') || t.includes('max_5') || t.includes('max5')
+
+  if (hasMax) {
+    if (looksMax20) return 'max20'
+    if (looksMax5) return 'max5'
+    return 'max5' // claude_max without explicit suffix — cc-bridge's documented conservative default
+  }
+  if (hasPro) return 'pro'
+
+  // No claude_max / claude_pro tag — fall back to tier shape
+  if (!t) return ''
+  if (looksMax20) return 'max20'
+  if (looksMax5) return 'max5'
+  if (t.includes('pro')) return 'pro'
+  if (t.includes('free') || t === 'default_claude_ai' || t === 'default') return 'free'
+  return t // unknown — surface raw value rather than guess
+}
+
+// ---------------------------------------------------------------------------
+// Step 1: organizations + tier
+// ---------------------------------------------------------------------------
+
+type ClaudeOrganization = {
+  uuid: string
+  raven_type?: string | null
+  rate_limit_tier?: string
+  capabilities?: string[]
+}
+
+/**
+ * Step 1: pull /api/organizations with the sessionKey cookie, pick the
+ * preferred org (raven_type=team first, else first), and normalize its tier.
+ * Goes through curl-impersonate (Chrome TLS) because claude.ai is CF-fronted.
+ */
+async function fetchOrganization(
+  sessionKey: string,
+  proxyId?: string,
+  step1ProxyUrl?: string | null,
+): Promise<{ orgUuid: string; subscriptionType: string; ravenType: string | null }> {
+  const overrideUrl = normalizeProxyUrl(step1ProxyUrl)
+  const proxyUrl = overrideUrl ?? await resolveProxyUrl(proxyId)
+  if (overrideUrl) {
+    console.log('[ck-import] step1 using residential proxy override (host:', overrideUrl.replace(/\/\/[^@]+@/, '//***@'), ')')
+  }
+  const resp = await curlImpersonateRequest({
+    url: ORGANIZATIONS_URL,
+    method: 'GET',
+    headers: {
+      Cookie: `sessionKey=${sessionKey}`,
+      Accept: 'application/json',
+    },
+    proxyUrl,
+    timeoutMs: 30_000,
+  })
+  if (resp.statusCode === 401 || resp.statusCode === 403) {
+    const body = resp.text
+    // Distinguish CF challenge / WAF block from actual sessionKey failure.
+    // CF page returns 403 with HTML body ("Just a moment...", "Cloudflare", etc),
+    // NOT JSON. Retrying with a different proxy / TLS fingerprint can succeed.
+    const looksCf = body.includes('<!DOCTYPE html>')
+                 || body.toLowerCase().includes('just a moment')
+                 || body.toLowerCase().includes('cf-mitigated')
+                 || body.toLowerCase().includes('cloudflare')
+                 || body.toLowerCase().includes('attention required')
+    if (looksCf) {
+      throw new Error(`Cloudflare blocked (HTTP ${resp.statusCode}, retryable): ${body.slice(0, 200).replace(/\s+/g, ' ')}`)
+    }
+    throw new Error(`sessionKey invalid (HTTP ${resp.statusCode}): ${body.slice(0, 200)}`)
+  }
+  if (resp.statusCode !== 200) {
+    throw new Error(`organizations HTTP ${resp.statusCode}: ${resp.text.slice(0, 200)}`)
+  }
+  let orgs: ClaudeOrganization[]
+  try {
+    orgs = JSON.parse(resp.text)
+  } catch (e) {
+    throw new Error(`organizations parse failed: ${(e as Error).message}`)
+  }
+  // FULL raw dump — lets you eyeball every field Anthropic sent so we can spot
+  // new tier-determining fields beyond rate_limit_tier / capabilities.
+  console.log('[ck-import] FULL organizations response:', resp.text.slice(0, 2000))
+  if (!Array.isArray(orgs) || orgs.length === 0) {
+    throw new Error('account has no organizations')
+  }
+  // Prefer team (raven) org, else first
+  const chosen = orgs.find((o) => o.raven_type === 'team') ?? orgs[0]
+  // Debug — surface exactly what Anthropic sent so the tier normalize can be
+  // tuned against real data when accounts come back ambiguous.
+  console.log('[ck-import] organizations response chosen org:', JSON.stringify({
+    uuid: chosen.uuid,
+    raven_type: chosen.raven_type ?? null,
+    rate_limit_tier: chosen.rate_limit_tier ?? '',
+    capabilities: chosen.capabilities ?? [],
+    org_count: orgs.length,
+  }))
+  const tier = normalizeSubscriptionTier(chosen.rate_limit_tier ?? '', chosen.capabilities ?? [])
+  // If raven_type is set (team plan), surface that distinction so admin UI can
+  // show "default_raven" same as cc-bridge does
+  const ravenType = chosen.raven_type ?? null
+  const subscriptionType = ravenType === 'team' && !tier ? 'default_raven' : tier
+  return { orgUuid: chosen.uuid, subscriptionType, ravenType }
+}
+
+// ---------------------------------------------------------------------------
+// Step 3: authorization code
+// ---------------------------------------------------------------------------
+
+async function fetchAuthorizationCode(
+  sessionKey: string,
+  orgUuid: string,
+  scope: string,
+  codeChallenge: string,
+  state: string,
+  proxyId?: string,
+  step1ProxyUrl?: string | null,
+): Promise<string> {
+  const url = AUTHORIZE_API_URL.replace('{org}', orgUuid)
+  const body = JSON.stringify({
+    response_type: 'code',
+    client_id: CLIENT_ID,
+    organization_uuid: orgUuid,
+    redirect_uri: REDIRECT_URI,
+    scope,
+    state,
+    code_challenge: codeChallenge,
+    code_challenge_method: 'S256',
+  })
+  const overrideUrl = normalizeProxyUrl(step1ProxyUrl)
+  const proxyUrl = overrideUrl ?? await resolveProxyUrl(proxyId)
+  if (overrideUrl) {
+    console.log('[ck-import] step2 (authorize) using residential proxy override')
+  }
+  const resp = await curlImpersonateRequest({
+    url,
+    method: 'POST',
+    headers: {
+      Cookie: `sessionKey=${sessionKey}`,
+      Accept: 'application/json',
+      'Content-Type': 'application/json',
+      Origin: 'https://claude.ai',
+      Referer: 'https://claude.ai/new',
+    },
+    body,
+    proxyUrl,
+    timeoutMs: 30_000,
+  })
+  if (resp.statusCode !== 200) {
+    throw new Error(`authorize HTTP ${resp.statusCode}: ${resp.text.slice(0, 200)}`)
+  }
+  let parsed: { redirect_uri?: string }
+  try {
+    parsed = JSON.parse(resp.text)
+  } catch (e) {
+    throw new Error(`authorize parse failed: ${(e as Error).message}`)
+  }
+  const redirect = parsed.redirect_uri ?? ''
+  const qPos = redirect.indexOf('?')
+  if (qPos < 0) throw new Error(`authorize no query in redirect_uri: ${redirect.slice(0, 100)}`)
+  let code: string | null = null
+  let respState: string | null = null
+  for (const pair of redirect.slice(qPos + 1).split('&')) {
+    const eq = pair.indexOf('=')
+    const k = eq >= 0 ? pair.slice(0, eq) : pair
+    const v = eq >= 0 ? pair.slice(eq + 1) : ''
+    if (k === 'code') code = v
+    else if (k === 'state') respState = v
+  }
+  if (!code) throw new Error(`authorize no code in redirect_uri: ${redirect.slice(0, 100)}`)
+  // cc-bridge packs the state into the code as `code#state` for the token exchange step
+  return respState ? `${code}#${respState}` : code
+}
+
+// ---------------------------------------------------------------------------
+// Step 4: token exchange
+// ---------------------------------------------------------------------------
+
+type TokenExchangeRaw = {
+  access_token: string
+  refresh_token: string
+  expires_in?: number
+  scope?: string
+  organization?: { uuid?: string } | null
+  account?: { uuid?: string; email_address?: string } | null
+}
+
+async function exchangeCodeForToken(
+  rawCode: string,
+  codeVerifier: string,
+  fallbackState: string,
+  proxyId: string | undefined,
+  fallbackOrgUuid: string,
+): Promise<{
+  access_token: string
+  refresh_token: string
+  expires_in: number
+  expires_at: number
+  scope: string
+  organization_uuid: string
+  account_uuid: string
+  email_address: string
+}> {
+  const hashIdx = rawCode.indexOf('#')
+  const authCode = hashIdx >= 0 ? rawCode.slice(0, hashIdx) : rawCode
+  const codeState = hashIdx >= 0 ? rawCode.slice(hashIdx + 1) : ''
+
+  const body: any = {
+    grant_type: 'authorization_code',
+    code: authCode,
+    redirect_uri: REDIRECT_URI,
+    client_id: CLIENT_ID,
+    code_verifier: codeVerifier,
+  }
+  if (codeState) body.state = codeState
+  else if (fallbackState) body.state = fallbackState
+
+  const bodyStr = JSON.stringify(body)
+  // Match the header set used by cc-gateway's existing src/oauth.ts refresh
+  // path — proven to work against platform.claude.com/v1/oauth/token without
+  // any TLS fingerprinting workaround. cc-bridge's axios/1.13.6 UA isn't
+  // needed when calling from Node.js directly.
+  const resp = await requestExternal(TOKEN_URL, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Content-Length': String(Buffer.byteLength(bodyStr)),
+    },
+    body: bodyStr,
+    timeoutMs: 30_000,
+    proxyId,
+  })
+  if (resp.statusCode !== 200) {
+    throw new Error(`token exchange HTTP ${resp.statusCode}: ${resp.text.slice(0, 300)}`)
+  }
+  let tok: TokenExchangeRaw
+  try {
+    tok = JSON.parse(resp.text)
+  } catch (e) {
+    throw new Error(`token exchange parse failed: ${(e as Error).message}`)
+  }
+  const expiresIn = tok.expires_in && tok.expires_in > 0 ? tok.expires_in : 3600
+  const expiresAt = Math.floor(Date.now() / 1000) + expiresIn
+  return {
+    access_token: tok.access_token,
+    refresh_token: tok.refresh_token,
+    expires_in: expiresIn,
+    expires_at: expiresAt,
+    scope: tok.scope ?? '',
+    organization_uuid: tok.organization?.uuid ?? fallbackOrgUuid,
+    account_uuid: tok.account?.uuid ?? '',
+    email_address: tok.account?.email_address ?? '',
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Top-level: cookieAuth — does all 4 steps
+// ---------------------------------------------------------------------------
+
+export type CookieAuthResult = {
+  access_token: string
+  refresh_token: string
+  expires_in: number
+  expires_at: number // unix seconds (kept compatible with cc-bridge response shape)
+  scope: string
+  organization_uuid: string
+  account_uuid: string
+  email_address: string
+  subscription_type: string // pro / max5 / max20 / free / default_raven / ''
+}
+
+/**
+ * Run the full sessionKey → OAuth-token flow. Drop-in replacement for the
+ * previous cc-bridge `/admin/accounts/cookie-auth` HTTP call.
+ *
+ * @param sessionKey     claude.ai sessionKey ("sk-ant-sid02-...")
+ * @param proxyId        registered outbound proxy UUID (default for all steps,
+ *                       and the ONLY proxy used for step 4 = platform.claude.com
+ *                       token exchange, which never sits behind Cloudflare)
+ * @param step1ProxyUrl  optional residential rotating proxy URL applied to both
+ *                       CF-fronted requests:
+ *                         - step 1: GET claude.ai/api/organizations
+ *                         - step 2 (network call): POST claude.ai/v1/oauth/{org}/authorize
+ *                       When null/empty, both fall back to `proxyId` like before.
+ */
+export async function cookieAuth(
+  sessionKey: string,
+  proxyId?: string,
+  step1ProxyUrl?: string | null,
+): Promise<CookieAuthResult> {
+  if (!sessionKey || !sessionKey.trim()) {
+    throw new Error('sessionKey is empty')
+  }
+  // Step 1 (GET organizations) — may use residential override
+  const { orgUuid, subscriptionType } = await fetchOrganization(sessionKey, proxyId, step1ProxyUrl)
+  // PKCE (local, no network)
+  const state = generateState()
+  const codeVerifier = generateCodeVerifier()
+  const codeChallenge = generateCodeChallenge(codeVerifier)
+  // Step 2 (POST authorize, CF-fronted) — also gets residential override when provided
+  const rawCode = await fetchAuthorizationCode(
+    sessionKey,
+    orgUuid,
+    SCOPE_FULL,
+    codeChallenge,
+    state,
+    proxyId,
+    step1ProxyUrl,
+  )
+  // Step 3 (POST token, NOT CF-fronted) — always uses proxyId / static IP
+  const tok = await exchangeCodeForToken(rawCode, codeVerifier, state, proxyId, orgUuid)
+  return {
+    ...tok,
+    subscription_type: subscriptionType,
+  }
+}

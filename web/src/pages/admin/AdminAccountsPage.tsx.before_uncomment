@@ -1,0 +1,1261 @@
+import { useCallback, useEffect, useMemo, useState } from 'react'
+import { api } from '../../api/client'
+import {
+  Table,
+  Pill,
+  Button,
+  FilterBar,
+  Field,
+  GroupPill,
+  Input,
+  Select,
+  dialog,
+  type Column,
+} from '../../ui'
+import AccountDrawer, { type AccountGroup } from './_accounts/AccountDrawer'
+import NewAccountModal from './_accounts/NewAccountModal'
+import BulkEditModal from './_accounts/BulkEditModal'
+import ImportCKModal from './_accounts/ImportCKModal'
+import {
+  LetterIcon,
+  MiniBar,
+  UTIL_COLORS,
+  fmtRelative,
+  fmtDuration,
+  utilPct,
+  type ClaudeUtilization,
+} from './_accounts/parts'
+
+interface RowStats {
+  concurrent: number
+  rpm: number
+  tpm: number
+  daily_req: number
+  daily_tok: number
+  daily_cost: number
+  active_sessions: number
+  cooldown: boolean
+  cooldown_reason: string | null
+  cooldown_remaining_seconds: number
+  errors: number
+  claude_utilization: ClaudeUtilization | null
+  session_slots?: { used: number; max: number }
+  disguise?: {
+    learned: boolean
+    tools_count: number
+    learned_at: number | null
+    template_id?: string | null
+    template_name?: string | null
+    template_source?: 'learned' | 'manual' | 'cloned' | null
+  }
+}
+
+interface AccountListRow {
+  id: string
+  name: string
+  account_type: string | null
+  status: string
+  health_status: string
+  weight: number
+  max_rpm: number
+  max_tpm: number
+  max_concurrent: number
+  max_sessions: number
+  group_id: string | null
+  group_name: string | null
+  group_ids?: string[] | null
+  req_24h: number
+  ok_24h: number
+  limited_24h: number
+  last_used_at: string | null
+  last_error: string | null
+  email: string | null
+  created_at: string
+  cost_5h?: number
+  cost_48h?: number
+  banned_at: string | null
+  state?: AccountState
+  stats: RowStats
+}
+
+// 8 档账号状态 (后端 server/routes/oauth-accounts.ts computeAccountState 计算)
+type AccountState =
+  | 'active' | 'rate_limited' | 'quota_exhausted' | 'misconfigured'
+  | 'error_misc' | 'error' | 'expired' | 'banned' | 'disabled'
+
+// tailwind class strings — 6 距离避免相邻档色相撞
+
+type StatusFilter = 'all' | 'normal' | 'cooldown' | 'invalid' | 'banned' | 'refunded' | 'error_misc' | 'manual_stop'
+type SubscriptionFilter = 'all' | 'pro' | 'max5' | 'max20' | 'default_raven'
+
+/** 订阅档位 → 显示标签 + tailwind 颜色 */
+function subscriptionLabel(t?: string | null): string {
+  switch ((t || '').toLowerCase()) {
+    case 'pro': return 'Pro'
+    case 'max5': return 'Max 5x'
+    case 'max20': return 'Max 20x'
+    case 'default_raven': return 'Raven'
+    case 'max': return 'Max'
+    case 'free': return 'Free'
+    default: return t || '-'
+  }
+}
+function subscriptionBadgeClass(t?: string | null): string {
+  switch ((t || '').toLowerCase()) {
+    case 'max20': return 'bg-purple-100 text-purple-700 border-purple-200'
+    case 'max5':
+    case 'max': return 'bg-amber-100 text-amber-700 border-amber-200'
+    case 'pro': return 'bg-sky-100 text-sky-700 border-sky-200'
+    case 'default_raven': return 'bg-emerald-100 text-emerald-700 border-emerald-200'
+    case 'free': return 'bg-gray-100 text-gray-600 border-gray-200'
+    default: return 'bg-stone-100 text-stone-600 border-stone-200'
+  }
+}
+type ViewMode = 'grid' | 'list'
+
+const VIEW_MODE_KEY = 'admin-accounts-view-mode'
+
+function readInitialView(): ViewMode {
+  if (typeof window === 'undefined') return 'grid'
+  const v = window.localStorage.getItem(VIEW_MODE_KEY)
+  return v === 'list' ? 'list' : 'grid'
+}
+
+interface TodaySummary {
+  total_cost: number
+  avg_multiplier: number
+  request_count: number
+}
+
+interface CacheHitWindow {
+  c: number | null         // hit rate % (read / (read+write))
+  roi: number | null       // read / write
+  read_tokens: number
+  write_tokens: number
+}
+interface CacheHitResp {
+  windows: {
+    today?: CacheHitWindow
+    since_start?: CacheHitWindow
+  }
+  gateway_start_at: string | null
+  computed_at: string
+}
+
+function fmtUptime(startIso: string | null): string {
+  if (!startIso) return '-'
+  const ms = Date.now() - new Date(startIso).getTime()
+  if (ms < 0) return '-'
+  const s = Math.floor(ms / 1000)
+  if (s < 60) return s + 's'
+  const m = Math.floor(s / 60)
+  if (m < 60) return m + 'm'
+  const h = Math.floor(m / 60)
+  const mm = m % 60
+  if (h < 24) return h + 'h' + (mm > 0 ? ' ' + mm + 'm' : '')
+  const d = Math.floor(h / 24)
+  const hh = h % 24
+  return d + 'd' + (hh > 0 ? ' ' + hh + 'h' : '')
+}
+
+// 账号分类(基于用户提供的完整 4 类信号映射表)
+type AccountCategory =
+  | 'normal'        // status='active' + 不在 cooldown
+  | 'cooldown'      // status='active' + cooldown (429/529/5xx 临时)
+  | 'invalid'       // 失效 (token died, refresh 死,换 sessionKey 可救)
+  | 'banned'        // 封禁 (Anthropic 永封 org 或 token revoke)
+  | 'refunded'      // 退款 (Max 退款变 free/pro,OAuth 被禁用)
+  | 'error_misc'    // 异常 (status=error 但无明确 marker,如累积错误)
+  | 'manual_stop'   // status='disabled' + 无封禁特征 (后台手动停用)
+  | 'unknown'
+
+// 退款信号 — Max 退款后被 Anthropic 降级,OAuth 直接 403
+//   "OAuth authentication is currently not allowed for this organization"
+// 不是真封,只是组织 OAuth 权限被收回 — 跟 Pro/Free 升级到 Max 是反向操作
+const REFUNDED_MARKERS = [
+  'oauth authentication is currently not allowed',
+]
+// 永封信号 — 命中其一即归类「封禁」
+// 封禁信号 (上游真永封,救不回)
+//   400 + organization has been/is disabled / organization_disabled
+//   403 + OAuth token has been revoked
+//   401/403 + not allowed for this organization  (h.zeas 实际触发的)
+const BANNED_MARKERS = [
+  'organization has been disabled',
+  'organization is disabled',
+  'organization_disabled',
+  'oauth token has been revoked',
+  'not allowed for this organization',
+]
+// 失效信号 — token 死了但 refresh sessionKey 可救回
+// 失效信号 (token 死了,可补 sessionKey 救回)
+//   401 + Invalid authentication credentials / authentication_error / invalid x-api-key
+//   OAuth /token 400 + invalid_grant / refresh token not found
+const INVALID_MARKERS = [
+  // ↓↓↓ Anthropic 原始返回的字串 (按你 spec) ↓↓↓
+  'invalid authentication credentials',
+  'authentication_error',
+  'invalid x-api-key',
+  'invalid_grant',
+  'refresh token not found',
+  // ↓↓↓ gateway 内部人话化版本(account-pool.ts mapRefreshError 改写后存进 DB 的) ↓↓↓
+  'oauth refresh token is invalid',  // 包含 'invalid or expired',catch refresh_token 死的人话版
+  'upstream 401 + refresh failed',   // proxy.ts 我新加的 401 fail 路径写的
+  'upstream_401_pre_refresh',        // Too many errors 累计的 401 (refresh 前就 401,token 实际死了)
+  'token_dead_',                     // proxy.ts onRequestEnd 写的 token_dead_${status} 前缀 (覆盖 401/403/etc)
+  'anthropic 401 invalid-auth',      // proxy.ts 新加的 invalid-auth 直接标 error (2026-05-23)
+  'stuck in 401 cooldown loop',      // 早上手动 SQL 标的 stuck-loop 号
+]
+
+// 状态徽章 — 跟 classifyAccount 返回值一一对应
+const CATEGORY_LABEL: Record<AccountCategory, string> = {
+  normal:      '启用',
+  cooldown:    '限流',
+  invalid:     '失效',
+  banned:      '封禁',
+  refunded:    '退款',
+  error_misc:  '异常',
+  manual_stop: '停用',
+  unknown:     '-',
+}
+const CATEGORY_CLASS: Record<AccountCategory, string> = {
+  normal:      'bg-emerald-100 text-emerald-700 border-emerald-200',
+  cooldown:    'bg-amber-100 text-amber-700 border-amber-200',
+  invalid:     'bg-red-100 text-red-700 border-red-200',
+  banned:      'bg-zinc-800 text-zinc-100 border-zinc-700',
+  refunded:    'bg-orange-300 text-orange-900 border-orange-400',
+  error_misc:  'bg-orange-100 text-orange-700 border-orange-200',
+  manual_stop: 'bg-gray-100 text-gray-600 border-gray-200',
+  unknown:     'bg-stone-100 text-stone-600 border-stone-200',
+}
+
+function classifyAccount(r: AccountListRow): AccountCategory {
+  if (r.status === 'active') {
+    return r.stats?.cooldown ? 'cooldown' : 'normal'
+  }
+  const err = (r.last_error || '').toLowerCase()
+  // 退款 must check first — refund marker substring overlaps with banned
+  if (REFUNDED_MARKERS.some(m => err.includes(m))) return 'refunded'
+  if (BANNED_MARKERS.some(m => err.includes(m))) return 'banned'
+  if (INVALID_MARKERS.some(m => err.includes(m))) return 'invalid'
+  // 没匹配到任何 marker:
+  // 没匹配 marker:status='error' 来自「累积错误超阈值」之类,归「异常」不是「失效」
+  if (r.status === 'error')    return 'error_misc'
+  if (r.status === 'disabled') return 'manual_stop'  // disabled + 无 marker = 手动停用
+  return 'unknown'
+}
+
+export default function AdminAccountsPage() {
+  const [items, setItems] = useState<AccountListRow[]>([])
+  const [todaySummary, setTodaySummary] = useState<TodaySummary | null>(null)
+  const [cacheHit, setCacheHit] = useState<CacheHitResp | null>(null)
+  const [groups, setGroups] = useState<AccountGroup[]>([])
+  const [q, setQ] = useState('')
+  const [groupFilter, setGroupFilter] = useState<string>('')
+  const [statusFilter, setStatusFilter] = useState<StatusFilter>('all')
+  const [subscriptionFilter, setSubscriptionFilter] = useState<SubscriptionFilter>('all')
+  const [view, setView] = useState<ViewMode>(readInitialView)
+  const [selected, setSelected] = useState<string | null>(null)
+  const [drawerOpen, setDrawerOpen] = useState(false)
+  const [newOpen, setNewOpen] = useState(false)
+  const [importCKOpen, setImportCKOpen] = useState(false)
+  const [loading, setLoading] = useState(false)
+  const [bulkDeleting, setBulkDeleting] = useState(false)
+  const [bulkEditOpen, setBulkEditOpen] = useState(false)
+
+  // 9 列点击排序: desc → asc → null (回默认顺序) → desc...
+  type SortKey = 'rpm' | 'req_24h' | 'limited_24h' | 'slots' | 'cost_5h' | 'cost_48h' | 'last_used' | 'created_at' | 'banned_at'
+  const [sortKey, setSortKey] = useState<SortKey | null>(null)
+  const [sortDir, setSortDir] = useState<'asc' | 'desc'>('desc')
+  // 分批渐进渲染: 先 80 行秒开,浏览器空闲时再补,避免一次性 200+ 行卡顿
+  const [renderLimit, setRenderLimit] = useState(80)
+
+  // 取值函数: number 返 0/数字; timestamp 返 null 表示该行该列没值,要排到底部
+  const sortValue: Record<SortKey, (r: AccountListRow) => number | null> = {
+    rpm: (r) => Number(r.stats?.rpm ?? 0),
+    req_24h: (r) => Number(r.req_24h ?? 0),
+    limited_24h: (r) => Number(r.limited_24h ?? 0),
+    slots: (r) => Number(r.stats?.session_slots?.used ?? r.stats?.active_sessions ?? 0),
+    cost_5h: (r) => Number(r.cost_5h ?? 0),
+    cost_48h: (r) => Number(r.cost_48h ?? 0),
+    last_used: (r) => r.last_used_at ? new Date(r.last_used_at).getTime() : null,
+    created_at: (r) => r.created_at ? new Date(r.created_at).getTime() : null,
+    banned_at: (r) => r.banned_at ? new Date(r.banned_at).getTime() : null,
+  }
+  // 点击列头: 切到这列 desc; 同列再点 asc; 第三次取消排序
+  const handleSortClick = (k: SortKey) => {
+    if (sortKey !== k) { setSortKey(k); setSortDir('desc'); return }
+    if (sortDir === 'desc') { setSortDir('asc'); return }
+    setSortKey(null) // 第三次点 — 取消排序
+  }
+  // 可点击的列头组件,显示 ↓/↑ 箭头
+  const SortHeader = ({ skey, label }: { skey: SortKey, label: string }) => {
+    const active = sortKey === skey
+    const arrow = active ? (sortDir === 'desc' ? ' ↓' : ' ↑') : ''
+    return (
+      <button
+        onClick={(e) => { e.stopPropagation(); handleSortClick(skey) }}
+        className={`font-mono uppercase tracking-wider cursor-pointer ${active ? 'text-[var(--ink)]' : 'hover:text-[var(--ink)]'}`}
+      >
+        {label}{arrow}
+      </button>
+    )
+  }
+
+  // 多选: 用户勾选的账号 id 集合. 空集 → 批量按钮 fallback 到 "当前筛选全部"
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set())
+  const [error, setError] = useState<string | null>(null)
+
+  const toggleSelect = useCallback((id: string) => {
+    setSelectedIds((prev) => {
+      const next = new Set(prev)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
+      return next
+    })
+  }, [])
+
+  useEffect(() => {
+    if (typeof window !== 'undefined') {
+      window.localStorage.setItem(VIEW_MODE_KEY, view)
+    }
+  }, [view])
+
+  const load = useCallback(async (opts: { silent?: boolean } = {}) => {
+    if (!opts.silent) setLoading(true)
+    setError(null)
+    try {
+      const [accountsResp, groupsResp, summaryResp] = await Promise.all([
+        api<{ accounts: AccountListRow[] }>('/admin/oauth-accounts'),
+        api<{ items: AccountGroup[] }>('/admin/groups'),
+        api<TodaySummary>('/admin/oauth-accounts/today-summary').catch(() => null),
+      ])
+      setItems(accountsResp.accounts ?? [])
+      setGroups(groupsResp.items ?? [])
+      if (summaryResp) setTodaySummary(summaryResp)
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Failed to load accounts')
+    } finally {
+      if (!opts.silent) setLoading(false)
+    }
+  }, [])
+
+  useEffect(() => {
+    void load()
+  }, [load])
+
+  // 批量删除. 优先用 selectedIds (用户手动勾选), 为空则 fallback 到当前筛选全部.
+  const bulkDeleteShown = useCallback(async (ids: string[], mode: 'selection' | 'filter') => {
+    if (ids.length === 0) return
+    const ok = await dialog.confirm(
+      <div>
+        <p className="text-[13px] text-[var(--ink)]">
+          将永久删除 <span className="font-mono font-semibold text-[var(--err)]">{ids.length}</span> 个账号
+          ({mode === 'selection' ? '勾选的账号' : '当前筛选条件下的全部'})。
+        </p>
+        <p className="mt-1 text-[12px] text-[var(--ink-3)]">
+          删除前会先 drain (status=disabled) 并清理 Redis 状态,然后从 DB 移除。**不可恢复**。
+        </p>
+      </div>,
+      { danger: true, okLabel: `确认删除 ${ids.length} 个`, title: '批量删除账号' },
+    )
+    if (!ok) return
+    setBulkDeleting(true)
+    try {
+      const r = await api<{ deleted: number; failed: Array<{ id: string; error: string }> }>(
+        '/admin/oauth-accounts/bulk-delete',
+        { method: 'POST', body: JSON.stringify({ ids }) },
+      )
+      const failedTxt = r.failed.length > 0
+        ? `,${r.failed.length} 失败 (前 3: ${r.failed.slice(0, 3).map(f => f.error).join('; ')})`
+        : ''
+      await dialog.alert(
+        `已删除 ${r.deleted} 个账号${failedTxt}`,
+        { title: r.failed.length > 0 ? '部分成功' : '删除完成' },
+      )
+      setSelectedIds(new Set()) // 清空选择
+      await load()
+    } catch (e) {
+      await dialog.alert(
+        e instanceof Error ? e.message : '批量删除失败',
+        { title: '错误' },
+      )
+    } finally {
+      setBulkDeleting(false)
+    }
+  }, [load])
+
+  // 账号池主页 — 已改为手动刷新 (header "刷新" 按钮),
+  // 之前 5s 自动 polling 拖累 Postgres CPU (banned_first CTE 扫今天 partition).
+  // useEffect(() => {
+  //   const timer = window.setInterval(() => {
+  //     void load({ silent: true })
+  //   }, 5000)
+  //   return () => window.clearInterval(timer)
+  // }, [load])
+
+  // 全局 RPM = 所有账号 stats.rpm 之和。
+  // stats.rpm 来自后端 fetchRedisStats(zcard 60s 滑窗),已经按账号去过期清理,
+  // 这里直接累加即可代表当前 1 分钟实际打到 OAuth 池的请求数。
+  const globalRpm = useMemo(
+    () => items.reduce((sum, r) => sum + (r.stats?.rpm ?? 0), 0),
+    [items],
+  )
+  const totalConcurrent = useMemo(
+    () => items.reduce((sum, r) => sum + (r.stats?.concurrent ?? 0), 0),
+    [items],
+  )
+  const activeAccountCount = useMemo(
+    () => items.filter((r) => r.status === 'active' && !r.stats?.cooldown).length,
+    [items],
+  )
+  const cooldownCount = useMemo(
+    () => items.filter((r) => r.stats?.cooldown).length,
+    [items],
+  )
+
+  // 失效 / 封禁 计数 — 用户提供的 4 类信号表分类
+  const invalidCount = useMemo(
+    () => items.filter(r => classifyAccount(r) === 'invalid').length,
+    [items],
+  )
+  const bannedCount = useMemo(
+    () => items.filter(r => classifyAccount(r) === 'banned').length,
+    [items],
+  )
+  const refundedCount = useMemo(
+    () => items.filter(r => classifyAccount(r) === 'refunded').length,
+    [items],
+  )
+  const errorMiscCount = useMemo(
+    () => items.filter(r => classifyAccount(r) === 'error_misc').length,
+    [items],
+  )
+
+  const shown = useMemo(() => {
+    const needle = q.trim().toLowerCase()
+    return items.filter((row) => {
+      const ids = Array.isArray(row.group_ids) && row.group_ids.length > 0
+        ? row.group_ids
+        : (row.group_id ? [row.group_id] : [])
+      if (needle) {
+        const haystack = `${row.name} ${row.email ?? ''}`.toLowerCase()
+        if (!haystack.includes(needle)) return false
+      }
+      if (groupFilter === '__none__' && ids.length > 0) return false
+      if (groupFilter && groupFilter !== '__none__' && !ids.includes(groupFilter)) return false
+      if (statusFilter !== 'all') {
+        // 用 classifyAccount 统一判断:dropdown 选项跟徽章颜色一致
+        if (classifyAccount(row) !== statusFilter) return false
+      }
+      if (subscriptionFilter !== 'all') {
+        const t = (row.account_type || '').toLowerCase()
+        if (t !== subscriptionFilter) return false
+      }
+      return true
+    })
+  }, [items, q, groupFilter, statusFilter, subscriptionFilter])
+
+  // 重置渲染上限当数据集变化时 (筛选 / 排序 / 搜索后)
+  useEffect(() => { setRenderLimit(80) }, [q, groupFilter, statusFilter, subscriptionFilter, sortKey, sortDir])
+
+  // 在 shown 之后包一层 sorted — NULL 永远排底,不受 dir 影响
+  const sorted = useMemo(() => {
+    if (!sortKey) return shown
+    const get = sortValue[sortKey]
+    return [...shown].sort((a, b) => {
+      const av = get(a)
+      const bv = get(b)
+      if (av === null && bv === null) return 0
+      if (av === null) return 1
+      if (bv === null) return -1
+      return sortDir === 'asc' ? av - bv : bv - av
+    })
+  }, [shown, sortKey, sortDir])
+
+  // 浏览器空闲时分批扩大渲染窗口直到全部渲染完
+  useEffect(() => {
+    if (renderLimit >= sorted.length) return
+    const ric: (cb: () => void) => number =
+      (window as any).requestIdleCallback ?? ((cb: () => void) => window.setTimeout(cb, 16))
+    const cic: (id: number) => void =
+      (window as any).cancelIdleCallback ?? window.clearTimeout
+    const id = ric(() => setRenderLimit(l => Math.min(l + 80, sorted.length)))
+    return () => cic(id)
+  }, [renderLimit, sorted.length])
+
+  // 实际给 Table 的行 = sorted 截取到 renderLimit
+  const visible = useMemo(() => sorted.slice(0, renderLimit), [sorted, renderLimit])
+
+
+  function openDrawer(id: string) {
+    setSelected(id)
+    setDrawerOpen(true)
+  }
+  function closeDrawer() {
+    setDrawerOpen(false)
+  }
+
+  const listColumns: Column<AccountListRow>[] = [
+    {
+      key: '__select',
+      header: (
+        <input
+          type="checkbox"
+          aria-label="全选/取消全选当前筛选"
+          checked={shown.length > 0 && shown.every((r) => selectedIds.has(r.id))}
+          onChange={(e) => {
+            e.stopPropagation()
+            const all = e.target.checked
+            setSelectedIds((prev) => {
+              const next = new Set(prev)
+              for (const r of shown) {
+                if (all) next.add(r.id)
+                else next.delete(r.id)
+              }
+              return next
+            })
+          }}
+          onClick={(e) => e.stopPropagation()}
+          className="cursor-pointer"
+        />
+      ),
+      className: 'w-8',
+      render: (r) => (
+        <input
+          type="checkbox"
+          checked={selectedIds.has(r.id)}
+          onChange={() => toggleSelect(r.id)}
+          onClick={(e) => e.stopPropagation()}
+          className="cursor-pointer"
+        />
+      ),
+    },
+    {
+      key: 'name',
+      header: '账号',
+      render: (r) => (
+        <div className="flex items-center gap-2 min-w-0">
+          <LetterIcon name={r.name} type={r.account_type} />
+          <div className="flex flex-col min-w-0">
+            <span className="font-medium text-[13px] text-[var(--ink)] truncate">{r.name}</span>
+            <span className="font-mono text-[10px] text-[var(--ink-3)] truncate">
+              {r.email || `${r.account_type ?? '-'} · w${r.weight}`}
+            </span>
+          </div>
+        </div>
+      ),
+    },
+    {
+      key: 'group',
+      header: '分组',
+      className: 'whitespace-nowrap',
+      style: { minWidth: '120px' },
+      render: (r) => {
+        const ids = Array.isArray(r.group_ids) && r.group_ids.length > 0
+          ? r.group_ids
+          : (r.group_id ? [r.group_id] : [])
+        if (ids.length === 0) return <GroupPill id={null} name={null} />
+        return (
+          <span className="inline-flex flex-wrap gap-1">
+            {ids.map((gid, i) => {
+              const g = groups.find((x) => x.id === gid)
+              return (
+                <GroupPill
+                  key={i}
+                  id={gid}
+                  name={g?.name ?? null}
+                  color={g?.color ?? null}
+                />
+              )
+            })}
+          </span>
+        )
+      },
+    },
+    {
+      key: 'subscription',
+      header: '订阅',
+      className: 'whitespace-nowrap',
+      render: (r) => (
+        <span
+          className={`inline-flex items-center px-2 py-0.5 rounded text-[10px] font-medium border ${subscriptionBadgeClass(r.account_type)}`}
+        >
+          {subscriptionLabel(r.account_type)}
+        </span>
+      ),
+    },
+    {
+      key: 'status',
+      header: '状态',
+      className: 'whitespace-nowrap',
+      render: (r) => {
+        const cat = classifyAccount(r)
+        return (
+          <span className={`inline-flex items-center whitespace-nowrap px-2 py-0.5 rounded text-[10px] font-medium border ${CATEGORY_CLASS[cat]}`}>
+            {CATEGORY_LABEL[cat]}
+          </span>
+        )
+      },
+    },
+    {
+      key: 'rpm',
+      header: <SortHeader skey="rpm" label="RPM" />,
+      render: (r) => {
+        const rpm = r.stats.rpm ?? 0
+        const maxRpm = r.max_rpm ?? 0
+        const tone =
+          maxRpm > 0 && rpm >= maxRpm ? 'err' :
+          maxRpm > 0 && rpm / maxRpm >= 0.8 ? 'warn' : 'ok'
+        return (
+          <span className="inline-flex items-center gap-1.5">
+            <span className="w-1.5 h-1.5 rounded-full shrink-0" style={{ background: `var(--${tone})` }} />
+            <span className="font-mono tabular-nums text-[12px] text-[var(--ink)]">{rpm.toLocaleString()}</span>
+            {maxRpm > 0 && (
+              <span className="font-mono tabular-nums text-[10px] text-[var(--ink-3)]">/{maxRpm}</span>
+            )}
+          </span>
+        )
+      },
+    },
+    {
+      key: 'req_24h',
+      header: <SortHeader skey="req_24h" label="24h 请求" />,
+      render: (r) => (
+        <span className="font-mono tabular-nums text-[12px]">{r.req_24h.toLocaleString()}</span>
+      ),
+    },
+    {
+      key: 'success',
+      header: '24h 成功率',
+      render: (r) => {
+        if (r.req_24h === 0) return <span className="text-[var(--ink-3)]">-</span>
+        const pct = (r.ok_24h / r.req_24h) * 100
+        const tone = pct >= 95 ? 'ok' : pct >= 80 ? 'warn' : 'err'
+        return <Pill tone={tone}>{pct.toFixed(1)}%</Pill>
+      },
+    },
+    {
+      key: 'limited_24h',
+      header: <SortHeader skey="limited_24h" label="24h 限流" />,
+      render: (r) =>
+        r.limited_24h > 0 ? <Pill tone="warn">{r.limited_24h}</Pill>
+          : <span className="font-mono text-[var(--ink-3)]">0</span>,
+    },
+    {
+      key: 'slots',
+      header: <SortHeader skey="slots" label="会话" />,
+      render: (r) => {
+        const used = r.stats.session_slots?.used ?? r.stats.active_sessions ?? 0
+        const max = r.stats.session_slots?.max ?? r.max_sessions ?? 0
+        if (max === 0) return <span className="font-mono text-[11px] text-[var(--ink-3)]">-</span>
+        const ratio = used / max
+        const tone = ratio >= 1 ? 'err' : ratio >= 0.8 ? 'warn' : 'ok'
+        return (
+          <span className="inline-flex items-center gap-1.5">
+            <span className={`w-1.5 h-1.5 rounded-full shrink-0`} style={{ background: `var(--${tone})` }} />
+            <span className="font-mono text-[11px] text-[var(--ink-2)] tabular-nums">{used}/{max}</span>
+          </span>
+        )
+      },
+    },
+    {
+      key: 'disguise',
+      header: '伪装',
+      render: (r) => {
+        const d = r.stats.disguise
+        if (!d || !d.learned) return <Pill tone="mute">未学</Pill>
+        return (
+          <span className="inline-flex items-center gap-1.5">
+            <Pill tone="ok">已学</Pill>
+            <span className="font-mono text-[11px] text-[var(--ink-3)] tabular-nums">{d.tools_count} tools</span>
+          </span>
+        )
+      },
+    },
+    {
+      key: 'last_used',
+      header: <SortHeader skey="last_used" label="最近使用" />,
+      render: (r) => (
+        <span className="font-mono text-[11px] text-[var(--ink-3)]">
+          {r.last_used_at ? fmtRelative(r.last_used_at) : '-'}
+        </span>
+      ),
+    },
+    {
+      key: 'cost_5h',
+      header: <SortHeader skey="cost_5h" label="5H 费用" />,
+      className: 'whitespace-nowrap',
+      render: (r) => {
+        const v = Number(r.cost_5h ?? 0)
+        return (
+          <span className={`font-mono text-[11px] ${v > 0 ? 'text-[var(--ink)]' : 'text-[var(--ink-3)]'}`}>
+            ${v.toFixed(4)}
+          </span>
+        )
+      },
+    },
+    {
+      key: 'cost_48h',
+      header: <SortHeader skey="cost_48h" label="48H 费用" />,
+      className: 'whitespace-nowrap',
+      render: (r) => {
+        const v = Number(r.cost_48h ?? 0)
+        return (
+          <span className={`font-mono text-[11px] ${v > 0 ? 'text-[var(--ink)]' : 'text-[var(--ink-3)]'}`}>
+            ${v.toFixed(4)}
+          </span>
+        )
+      },
+    },
+    {
+      key: 'created_at',
+      header: <SortHeader skey="created_at" label="导入时间" />,
+      render: (r) => {
+        if (!r.created_at) return <span className="font-mono text-[11px] text-[var(--ink-3)]">-</span>
+        // 强制 Asia/Shanghai (UTC+8) 显示
+        const s = new Date(r.created_at).toLocaleString('zh-CN', {
+          timeZone: 'Asia/Shanghai',
+          year: 'numeric', month: '2-digit', day: '2-digit',
+          hour: '2-digit', minute: '2-digit', hour12: false,
+        }).replace(/\//g, '-')
+        return (
+          <span className="font-mono text-[11px] text-[var(--ink-3)]" title={r.created_at}>
+            {s}
+          </span>
+        )
+      },
+    },
+    {
+      key: 'banned_at',
+      header: <SortHeader skey="banned_at" label="封号时间" />,
+      render: (r) => {
+        if (!r.banned_at) return <span className="font-mono text-[11px] text-[var(--ink-3)]">-</span>
+        // 强制 Asia/Shanghai (UTC+8) 显示, 不受浏览器时区影响
+        const s = new Date(r.banned_at).toLocaleString('zh-CN', {
+          timeZone: 'Asia/Shanghai',
+          year: 'numeric', month: '2-digit', day: '2-digit',
+          hour: '2-digit', minute: '2-digit', hour12: false,
+        }).replace(/\//g, '-')
+        return (
+          <span className="font-mono text-[11px] text-[var(--err)]" title={r.banned_at}>
+            {s}
+          </span>
+        )
+      },
+    },
+    {
+      key: 'action',
+      header: '',
+      render: (r) => (
+        <Button variant="ghost" size="sm" onClick={() => openDrawer(r.id)}>
+          详情
+        </Button>
+      ),
+    },
+  ]
+
+  // Cache hit rate widget: poll /cache-hit-rate every 30s.
+  useEffect(() => {
+    const fetchOnce = () => {
+      api<CacheHitResp>('/admin/oauth-accounts/cache-hit-rate')
+        .then(setCacheHit)
+        .catch(() => {})
+    }
+    fetchOnce()
+    const t = window.setInterval(fetchOnce, 30_000)
+    return () => window.clearInterval(t)
+  }, [])
+
+  return (
+    <div className="max-w-[1600px] mx-auto space-y-6">
+      <header className="flex items-end justify-between gap-4 flex-wrap">
+        <div>
+          <h1 className="font-serif text-[26px] text-[var(--ink)]">账号池</h1>
+          <p className="text-[13px] text-[var(--ink-3)] mt-1">OAuth 账号调度与健康 · 点右上"刷新"按钮更新</p>
+        </div>
+        <div className="flex items-stretch gap-2 flex-wrap">
+          <GlobalStat label="全局 RPM" value={globalRpm.toLocaleString()} hint="最近 60s" />
+          <GlobalStat
+            label="今日总额度"
+            value={`$${(todaySummary?.total_cost ?? 0).toFixed(2)}`}
+            hint="今日累计 (计费价)"
+          />
+          <GlobalStat
+            label="平均倍率"
+            value={todaySummary ? `×${todaySummary.avg_multiplier.toFixed(3).replace(/\.?0+$/, '')}` : '—'}
+            hint="加权 · 今日"
+          />
+          <GlobalStat
+            label="实时并发"
+            value={totalConcurrent.toLocaleString()}
+            hint="当前在飞"
+          />
+          <GlobalStat
+            label="缓存命中率 · 今日"
+            value={cacheHit?.windows.today?.c != null ? `${cacheHit.windows.today.c.toFixed(1)}%` : '-'}
+            hint={cacheHit?.windows.today?.roi != null ? `写 1 读 ${cacheHit.windows.today.roi.toFixed(1)} 次` : undefined}
+          />
+          <GlobalStat
+            label="缓存命中率 · 启动以来"
+            value={cacheHit?.windows.since_start?.c != null ? `${cacheHit.windows.since_start.c.toFixed(1)}%` : '-'}
+            hint={cacheHit?.gateway_start_at ? `运行 ${fmtUptime(cacheHit.gateway_start_at)}` : undefined}
+          />
+          <GlobalStat label="可用账号" value={`${activeAccountCount}/${items.length}`} />
+          <GlobalStat label="冷却中" value={String(cooldownCount)} tone={cooldownCount > 0 ? 'warn' : undefined} />
+        </div>
+      </header>
+      <FilterBar>
+        <Field label="搜索">
+          <Input
+            value={q}
+            onChange={(e) => setQ(e.target.value)}
+            placeholder="账号名 / 邮箱…"
+          />
+        </Field>
+        <Field label="分组">
+          <Select value={groupFilter} onChange={(e) => setGroupFilter(e.target.value)}>
+            <option value="">全部分组</option>
+            <option value="__none__">共享池（无分组）</option>
+            {groups.map((g) => (
+              <option key={g.id} value={g.id}>{g.name}</option>
+            ))}
+          </Select>
+        </Field>
+        <Field label="状态">
+          <Select value={statusFilter} onChange={(e) => setStatusFilter(e.target.value as StatusFilter)}>
+            <option value="all">全部</option>
+            <option value="normal">启用</option>
+            <option value="cooldown">限流</option>
+            <option value="invalid">失效</option>
+            <option value="banned">封禁</option>
+            <option value="refunded">退款</option>
+            <option value="error_misc">异常</option>
+            <option value="manual_stop">停用</option>
+          </Select>
+        </Field>
+        <Field label="订阅">
+          <Select value={subscriptionFilter} onChange={(e) => setSubscriptionFilter(e.target.value as SubscriptionFilter)}>
+            <option value="all">全部</option>
+            <option value="max20">Max 20x</option>
+            <option value="max5">Max 5x</option>
+            <option value="pro">Pro</option>
+            <option value="default_raven">Raven</option>
+          </Select>
+        </Field>
+        {/* 失效 / 封禁 内联计数徽章, 包在 Field 里跟其他下拉框对齐 */}
+        <Field label="分类">
+          <div className="flex items-center gap-1.5 h-[30px]">
+            <button
+              type="button"
+              onClick={() => setStatusFilter(statusFilter === 'invalid' ? 'all' : 'invalid')}
+              className={`inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded text-[12px] font-medium border transition ${
+                statusFilter === 'invalid'
+                  ? 'bg-red-600 text-white border-red-700 shadow-sm'
+                  : 'bg-red-100 text-red-700 border-red-200 hover:bg-red-200'
+              }`}
+              title="上游 401 token 失效 (Invalid auth credentials / authentication_error / x-api-key / refresh invalid_grant) — 可补 sessionKey 救回。点击筛选"
+            >
+              <span>失效</span>
+              <span className="font-mono font-bold">{invalidCount}</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => setStatusFilter(statusFilter === 'banned' ? 'all' : 'banned')}
+              className={`inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded text-[12px] font-medium border transition ${
+                statusFilter === 'banned'
+                  ? 'bg-zinc-900 text-white border-zinc-950 shadow-sm'
+                  : 'bg-zinc-800 text-zinc-100 border-zinc-700 hover:bg-zinc-900'
+              }`}
+              title="Anthropic 永封 (org disabled / oauth token revoked / not allowed for org) — 救不回。点击筛选"
+            >
+              <span>封禁</span>
+              <span className="font-mono font-bold">{bannedCount}</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => setStatusFilter(statusFilter === 'refunded' ? 'all' : 'refunded')}
+              className={`inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded text-[12px] font-medium border transition ${
+                statusFilter === 'refunded'
+                  ? 'bg-orange-500 text-white border-orange-600 shadow-sm'
+                  : 'bg-orange-300 text-orange-900 border-orange-400 hover:bg-orange-400'
+              }`}
+              title="退款 (Max 退款变 Free/Pro,OAuth authentication is currently not allowed) — 没救但跟封禁原因不同。点击筛选"
+            >
+              <span>退款</span>
+              <span className="font-mono font-bold">{refundedCount}</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => setStatusFilter(statusFilter === 'error_misc' ? 'all' : 'error_misc')}
+              className={`inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded text-[12px] font-medium border transition whitespace-nowrap ${
+                statusFilter === 'error_misc'
+                  ? 'bg-orange-300 text-orange-900 border-orange-400 shadow-sm'
+                  : 'bg-orange-100 text-orange-700 border-orange-200 hover:bg-orange-200'
+              }`}
+              title="异常 (status=error 但无明确 marker,比如累积错误超阈值如 502 误杀)。点击筛选"
+            >
+              <span>异常</span>
+              <span className="font-mono font-bold">{errorMiscCount}</span>
+            </button>
+          </div>
+        </Field>
+        <div className="ml-auto flex items-center gap-2">
+          <span className="font-mono text-[10px] uppercase tracking-wider text-[var(--ink-3)]">
+            共 {shown.length} / {items.length}
+            {selectedIds.size > 0 && (
+              <span className="ml-2 text-[var(--accent)]">· 已选 {selectedIds.size}</span>
+            )}
+          </span>
+          {selectedIds.size > 0 && (
+            <button
+              type="button"
+              className="text-[11px] font-mono uppercase tracking-wider text-[var(--ink-3)] hover:text-[var(--ink)] underline-offset-2 hover:underline"
+              onClick={() => setSelectedIds(new Set())}
+            >
+              清空
+            </button>
+          )}
+          <div className="inline-flex border border-[var(--rule)] rounded overflow-hidden">
+            <button
+              onClick={() => setView('grid')}
+              className={`px-2 py-1 text-[11px] font-mono uppercase tracking-wider ${
+                view === 'grid' ? 'bg-[var(--ink)] text-[var(--bg)]' : 'text-[var(--ink-2)] hover:bg-[var(--mute-bg)]'
+              }`}
+            >
+              卡片
+            </button>
+            <button
+              onClick={() => setView('list')}
+              className={`px-2 py-1 text-[11px] font-mono uppercase tracking-wider ${
+                view === 'list' ? 'bg-[var(--ink)] text-[var(--bg)]' : 'text-[var(--ink-2)] hover:bg-[var(--mute-bg)]'
+              }`}
+            >
+              列表
+            </button>
+          </div>
+          <Button variant="default" size="sm" onClick={() => setImportCKOpen(true)}>
+            导入 CK
+          </Button>
+          <Button variant="default" size="sm" onClick={() => setNewOpen(true)}>
+            新建账号
+          </Button>
+          <Button
+
+            size="sm"
+
+            variant="default"
+
+            disabled={selectedIds.size === 0}
+
+            onClick={() => setBulkEditOpen(true)}
+
+            title={`批量修改勾选的 ${selectedIds.size} 个账号(策略 / 选项 / 分组)`}
+
+          >
+
+            批量修改 ({selectedIds.size})
+
+          </Button><Button
+            variant="default"
+            size="sm"
+            disabled={bulkDeleting || (selectedIds.size === 0 && shown.length === 0)}
+            onClick={() => {
+              if (selectedIds.size > 0) {
+                void bulkDeleteShown([...selectedIds], 'selection')
+              } else {
+                void bulkDeleteShown(shown.map((r) => r.id), 'filter')
+              }
+            }}
+            title={
+              selectedIds.size > 0
+                ? `删除勾选的 ${selectedIds.size} 个账号`
+                : '删除当前筛选条件下的全部账号 (没有勾选时默认全部)'
+            }
+          >
+            {bulkDeleting
+              ? '删除中…'
+              : selectedIds.size > 0
+                ? `批量删除 (${selectedIds.size})`
+                : `批量删除 (${shown.length} 当前筛选)`}
+          </Button>
+          <Button variant="default" size="sm" onClick={() => void load()} disabled={loading}>
+            刷新
+          </Button>
+        </div>
+      </FilterBar>
+
+      {error && (
+        <div className="border border-[var(--err)] text-[var(--err)] p-2 text-[12px] rounded">
+          {error}
+        </div>
+      )}
+
+      {view === 'grid' ? (
+        shown.length === 0 ? (
+          <div className="border border-[var(--rule)] rounded bg-[var(--surface)] p-6 text-[13px] text-[var(--ink-3)] text-center">
+            {loading ? '加载中…' : '没有匹配的账号。'}
+          </div>
+        ) : (
+          <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
+            {shown.map((row) => (
+              <AccountCard
+                key={row.id}
+                row={row}
+                groups={groups}
+                onOpen={() => openDrawer(row.id)}
+                selected={selectedIds.has(row.id)}
+                onToggleSelect={() => toggleSelect(row.id)}
+              />
+            ))}
+          </div>
+        )
+      ) : (
+        <div className="border border-[var(--rule)] rounded overflow-hidden bg-[var(--surface)]">
+          <Table<AccountListRow>
+            rows={visible}
+            columns={listColumns}
+            onRowClick={(r) => openDrawer(r.id)}
+            emptyLabel={loading ? '加载中…' : '没有匹配的账号。'}
+          />
+        </div>
+      )}
+
+      <AccountDrawer
+        accountId={selected}
+        groups={groups}
+        open={drawerOpen && selected !== null}
+        onClose={closeDrawer}
+        onChange={() => void load()}
+      />
+
+      <NewAccountModal
+        open={newOpen}
+        onClose={() => setNewOpen(false)}
+        onSuccess={() => { setNewOpen(false); void load() }}
+      />
+
+      <ImportCKModal
+        open={importCKOpen}
+        onClose={() => setImportCKOpen(false)}
+        onSuccess={() => { void load() }}
+      />
+
+      <BulkEditModal
+        open={bulkEditOpen}
+        accountIds={[...selectedIds]}
+        onClose={() => setBulkEditOpen(false)}
+        onSuccess={() => { setBulkEditOpen(false); setSelectedIds(new Set()); void load() }}
+      />
+    </div>
+  )
+}
+
+function AccountCard({ row, groups, onOpen, selected, onToggleSelect }: {
+  row: AccountListRow
+  groups: AccountGroup[]
+  onOpen: () => void
+  selected: boolean
+  onToggleSelect: () => void
+}) {
+  const util = row.stats.claude_utilization
+  const fiveH = utilPct(util?.five_hour)
+  const sevenD = utilPct(util?.seven_day)
+  const opus = utilPct(util?.seven_day_opus)
+  const sonnet = utilPct(util?.seven_day_sonnet)
+  const ids = Array.isArray(row.group_ids) && row.group_ids.length > 0
+    ? row.group_ids
+    : (row.group_id ? [row.group_id] : [])
+  const accountGroups = ids.map((gid) => {
+    const g = groups.find((x) => x.id === gid)
+    return { id: gid, name: g?.name ?? null, color: g?.color ?? null }
+  })
+
+  return (
+    <button
+      onClick={onOpen}
+      className={`text-left border bg-[var(--surface)] rounded-lg p-3 flex flex-col gap-3 hover:border-[var(--ink-3)] hover:shadow-sm transition-all ${
+        selected ? 'border-[var(--accent)] ring-1 ring-[var(--accent)]' : 'border-[var(--rule)]'
+      }`}
+    >
+      {/* Header */}
+      <div className="flex items-start gap-2 min-w-0">
+        <input
+          type="checkbox"
+          checked={selected}
+          onChange={onToggleSelect}
+          onClick={(e) => e.stopPropagation()}
+          aria-label={`选择 ${row.name}`}
+          className="mt-1 cursor-pointer shrink-0"
+        />
+        <LetterIcon name={row.name} type={row.account_type} />
+        <div className="flex-1 min-w-0 space-y-1.5">
+          {/* 行 1: 名字 + 状态 */}
+          <div className="flex items-center gap-1.5 flex-wrap">
+            <span className="text-[14px] font-semibold text-[var(--ink)] truncate">{row.name}</span>
+            {(() => {
+              const cat = classifyAccount(row)
+              return (
+                <span className={`inline-flex items-center px-2 py-0.5 rounded text-[10px] font-medium border ${CATEGORY_CLASS[cat]}`}>
+                  {CATEGORY_LABEL[cat]}
+                </span>
+              )
+            })()}
+          </div>
+
+          {/* 行 2: 订阅 + 分组 */}
+          <div className="flex items-center gap-1.5 flex-wrap">
+            <span
+              className={`inline-flex items-center px-2 py-0.5 rounded text-[10px] font-medium border ${subscriptionBadgeClass(row.account_type)}`}
+            >
+              {subscriptionLabel(row.account_type)}
+            </span>
+            {accountGroups.length > 0 ? (
+              accountGroups.map((g, i) => (
+                <GroupPill key={i} id={g.id} name={g.name} color={g.color} />
+              ))
+            ) : (
+              <GroupPill id={null} name={null} />
+            )}
+          </div>
+
+          {/* 行 3 (可选): 错误 / 冷却 原因 */}
+          {row.stats.cooldown && row.stats.cooldown_reason && (
+            <div className="text-[10px] text-[var(--warn)] truncate">
+              {row.stats.cooldown_reason}
+              {row.stats.cooldown_remaining_seconds > 0 ? ` · ${fmtDuration(row.stats.cooldown_remaining_seconds)}` : ''}
+            </div>
+          )}
+          {!row.stats.cooldown && row.last_error && (
+            <div className="text-[10px] text-[var(--err)] truncate">
+              {row.last_error}
+            </div>
+          )}
+
+          {/* 行 4: 最后使用时间 */}
+          <div className="text-[10px] text-[var(--ink-3)] truncate font-mono">
+            {fmtRelative(row.last_used_at) || '从未使用'}
+          </div>
+        </div>
+      </div>
+
+      {/* Mini bars */}
+      <div className="grid grid-cols-2 gap-x-3 gap-y-2">
+        <MiniBar label="5h" percentage={fiveH} color={UTIL_COLORS.five_hour} />
+        <MiniBar label="7d" percentage={sevenD} color={UTIL_COLORS.seven_day} />
+        <MiniBar label="Opus" percentage={opus} color={UTIL_COLORS.opus} />
+        <MiniBar label="Sonnet" percentage={sonnet} color={UTIL_COLORS.sonnet} />
+      </div>
+
+      {/* Slots + CC disguise quick status */}
+      <SlotsAndDisguise row={row} />
+
+      {/* Live (60s 滑窗 + 并发) — 每 5s 由列表 silent refresh 重拉 */}
+      <LiveStats row={row} />
+
+      {/* Footer daily */}
+      <div className="pt-2 border-t border-[var(--rule-2)] flex items-center justify-between text-[11px] text-[var(--ink-3)] tabular-nums font-mono">
+        <span>{row.stats.daily_req.toLocaleString()} 请求</span>
+        <span>{row.stats.daily_tok.toLocaleString()} tok</span>
+        <span className="text-[var(--ink)] font-medium">${row.stats.daily_cost.toFixed(2)}</span>
+      </div>
+    </button>
+  )
+}
+
+function LiveStats({ row }: { row: AccountListRow }) {
+  const rpm = row.stats.rpm ?? 0
+  const tpm = row.stats.tpm ?? 0
+  const concurrent = row.stats.concurrent ?? 0
+  const maxRpm = row.max_rpm ?? 0
+  const rpmTone =
+    maxRpm > 0 && rpm >= maxRpm ? 'err' :
+    maxRpm > 0 && rpm / maxRpm >= 0.8 ? 'warn' : 'ok'
+
+  return (
+    <div className="grid grid-cols-3 gap-2 text-[11px]">
+      <LiveCell
+        label="RPM"
+        value={rpm.toLocaleString()}
+        tone={rpmTone}
+        sub={maxRpm > 0 ? `/${maxRpm}` : undefined}
+      />
+      <LiveCell label="TPM" value={tpm >= 1000 ? `${(tpm / 1000).toFixed(1)}k` : String(tpm)} />
+      <LiveCell label="并发" value={String(concurrent)} />
+    </div>
+  )
+}
+
+function LiveCell({ label, value, sub, tone }: {
+  label: string
+  value: string
+  sub?: string
+  tone?: 'ok' | 'warn' | 'err'
+}) {
+  const valueColor =
+    tone === 'warn' ? 'text-[var(--warn)]' :
+    tone === 'err'  ? 'text-[var(--err)]'  :
+                      'text-[var(--ink)]'
+  return (
+    <div className="flex flex-col items-start bg-[var(--rule-2)] rounded px-2 py-1">
+      <span className="font-mono text-[9px] uppercase tracking-wider text-[var(--ink-3)]">{label}</span>
+      <span className="flex items-baseline gap-0.5">
+        <span className={`font-mono tabular-nums text-[14px] leading-tight ${valueColor}`}>{value}</span>
+        {sub && <span className="font-mono text-[9px] text-[var(--ink-3)] tabular-nums">{sub}</span>}
+      </span>
+    </div>
+  )
+}
+
+function GlobalStat({ label, value, hint, tone }: {
+  label: string
+  value: string
+  hint?: string
+  tone?: 'warn' | 'err'
+}) {
+  const valueColor =
+    tone === 'warn' ? 'text-[var(--warn)]' :
+    tone === 'err'  ? 'text-[var(--err)]'  :
+                      'text-[var(--ink)]'
+  return (
+    <div className="border border-[var(--rule)] bg-[var(--surface)] rounded px-3 py-2 min-w-[120px] flex flex-col">
+      <span className="font-mono text-[10px] uppercase tracking-wider text-[var(--ink-3)]">{label}</span>
+      <span className={`font-mono tabular-nums text-[20px] leading-tight ${valueColor}`}>{value}</span>
+      {hint && <span className="font-mono text-[9px] uppercase tracking-wider text-[var(--ink-3)] mt-0.5">{hint}</span>}
+    </div>
+  )
+}
+
+function SlotsAndDisguise({ row }: { row: AccountListRow }) {
+  const used = row.stats.session_slots?.used ?? row.stats.active_sessions ?? 0
+  const max = row.stats.session_slots?.max ?? row.max_sessions ?? 0
+  const d = row.stats.disguise
+  const slotsTone =
+    max === 0 ? 'mute' :
+    used / max >= 1 ? 'err' :
+    used / max >= 0.8 ? 'warn' : 'ok'
+
+  return (
+    <div className="flex items-center justify-between gap-2 text-[11px]">
+      <span className="inline-flex items-center gap-1.5 text-[var(--ink-3)]">
+        <span className="font-mono uppercase tracking-wider text-[10px]">Slots</span>
+        <span className="w-1.5 h-1.5 rounded-full shrink-0" style={{ background: `var(--${slotsTone})` }} />
+        <span className="font-mono tabular-nums text-[var(--ink-2)]">{used}/{max || '—'}</span>
+      </span>
+      <span className="inline-flex items-center gap-1.5 text-[var(--ink-3)]">
+        <span className="font-mono uppercase tracking-wider text-[10px]">CC</span>
+        {d?.learned ? (
+          <>
+            <span className="w-1.5 h-1.5 rounded-full shrink-0" style={{ background: 'var(--ok)' }} />
+            <span className="font-mono tabular-nums text-[var(--ink-2)]">{d.tools_count} tools</span>
+          </>
+        ) : (
+          <>
+            <span className="w-1.5 h-1.5 rounded-full shrink-0" style={{ background: 'var(--ink-3)' }} />
+            <span className="font-mono text-[var(--ink-3)]">未学</span>
+          </>
+        )}
+      </span>
+    </div>
+  )
+}

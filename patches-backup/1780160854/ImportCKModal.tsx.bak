@@ -1,0 +1,801 @@
+import { useEffect, useState } from 'react'
+import { api } from '../../../api/client'
+import { Modal } from '../../../ui/Modal'
+import { Segmented } from '../../../ui/Segmented'
+import { Field, Input, Select } from '../../../ui/Field'
+import { Button } from '../../../ui/Button'
+import AccountPolicyFields, { DEFAULT_POLICY, type PolicyValues } from './AccountPolicyFields'
+import AccountOptionsForm, { OAUTH_DEFAULT_OPTIONS, type AccountOptions } from './AccountOptionsForm'
+
+interface OutboundProxy {
+  id: string
+  name: string
+  scheme: string
+  host: string
+  port: number
+  bound_count?: number
+  bound_active?: number
+}
+
+interface AccountGroup {
+  id: string
+  name: string
+  is_default?: boolean
+}
+
+interface TemplateOption {
+  id: string
+  name: string
+  source: 'manual' | 'cloned' | 'imported'
+  is_default: boolean
+  used_by?: number
+}
+
+interface BatchResult {
+  ok: boolean
+  index: number
+  session_key_hint: string
+  proxy_id?: string
+  account?: { id: string; name: string; email?: string; plan?: string }
+  error?: string
+  duplicate?: boolean
+}
+
+/**
+ * 判定一条 import 失败结果是否值得重试.
+ * 不可重试 (账号 / 配置 层面的硬错误,重试也是同样结果):
+ *   - "sessionKey invalid" / HTTP 401 / HTTP 403 — claude.ai 拒绝凭据, 号死了
+ *   - "no organizations" — 这个号下没组织, 数据问题
+ *   - "outbound proxy" — 绑定代理不可用 / 不存在, 需要先改代理配置
+ * 可重试 (默认): 网络抖动 / 5xx / CF transient / timeout / parse / 进程错误
+ */
+function isRetryableError(err: string | undefined): boolean {
+  if (!err) return true
+  const e = err.toLowerCase()
+  // CF challenge / WAF block → retryable (different TLS fingerprint / proxy may succeed)
+  if (e.includes('cloudflare') || e.includes('just a moment')
+      || e.includes('cf-mitigated') || e.includes('<!doctype html')
+      || e.includes('attention required')) return true
+  // Real account/config errors → not retryable
+  if (e.includes('sessionkey invalid')) return false
+  if (e.includes('http 401')) return false
+  if (e.includes('http 403')) return false
+  if (e.includes('no organizations')) return false
+  if (e.includes('outbound proxy')) return false
+  return true
+}
+
+interface Props {
+  open: boolean
+  onClose: () => void
+  onSuccess: () => void
+}
+
+type ProxyMode = 'existing' | 'new'
+
+export default function ImportCKModal({ open, onClose, onSuccess }: Props) {
+  const [mode, setMode] = useState<'single' | 'batch'>('single')
+  const [proxies, setProxies] = useState<OutboundProxy[]>([])
+  const [templates, setTemplates] = useState<TemplateOption[]>([])
+  const [groups, setGroups] = useState<AccountGroup[]>([])
+  const [selectedGroupIds, setSelectedGroupIds] = useState<Set<string>>(new Set())
+
+  // single 输入
+  const [sessionKey, setSessionKey] = useState('')
+  const [name, setName] = useState('')
+  const [singleProxyId, setSingleProxyId] = useState<string>('')
+
+  // batch 输入
+  const [batchKeys, setBatchKeys] = useState('')
+  const [proxyMode, setProxyMode] = useState<ProxyMode>('existing')
+  const [onlyUnbound, setOnlyUnbound] = useState(true)
+  const [batchExistingIds, setBatchExistingIds] = useState<Set<string>>(new Set())
+  const [batchNewProxies, setBatchNewProxies] = useState('')
+  const [accountsPerProxy, setAccountsPerProxy] = useState(1)
+  const [namePrefix, setNamePrefix] = useState('')
+
+  // 共同
+  const [templateId, setTemplateId] = useState<string>('')
+
+  // 策略 (默认值跟新建账号 step 3 一致, 通过 DEFAULT_POLICY 共享)
+  const [policy, setPolicy] = useState<PolicyValues>(DEFAULT_POLICY)
+  // 账号选项 (校验/清洗/覆盖/事件 - 完整一套, 跟 NewAccountModal step 3 一致)
+  const [options, setOptions] = useState<AccountOptions>(OAUTH_DEFAULT_OPTIONS)
+  const [showPolicy, setShowPolicy] = useState(false)
+
+  // state
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const [batchSummary, setBatchSummary] = useState<{
+    total: number; ok: number; failed: number; duplicate?: number
+    input_duplicates?: number
+    proxy_pool_size?: number; accounts_per_proxy?: number
+    proxy_errors?: Array<{ index: number; input: string; error: string }>
+    results: BatchResult[]
+  } | null>(null)
+  // 记住上次提交的完整 sessionKey 数组, 用来支持"失败重试"
+  const [lastBatchKeys, setLastBatchKeys] = useState<string[]>([])
+  const [singleResult, setSingleResult] = useState<BatchResult | null>(null)
+  const [retryProxyModalOpen, setRetryProxyModalOpen] = useState(false)
+  const [retryNewProxies, setRetryNewProxies] = useState('')
+
+  useEffect(() => {
+    if (!open) return
+    setError(null); setBatchSummary(null); setSingleResult(null)
+    Promise.all([
+      api('/admin/outbound-proxies').catch(() => ({ items: [] })),
+      api('/admin/cc-disguise-templates').catch(() => ({ items: [] })),
+      api('/admin/groups').catch(() => ({ items: [] })),
+    ]).then(([px, tx, gx]) => {
+      const pList = Array.isArray(px) ? px : (px.items ?? px.proxies ?? [])
+      const tList = Array.isArray(tx) ? tx : (tx.items ?? tx.templates ?? [])
+      const gList = Array.isArray(gx) ? gx : (gx.items ?? gx.groups ?? [])
+      setProxies(pList)
+      setTemplates(tList)
+      setGroups(gList)
+      const defaultTpl = tList.find((t: any) => t.is_default) ?? tList[0]
+      if (defaultTpl) setTemplateId(defaultTpl.id)
+      // Pre-select default group (matches v5 strict group-isolation: bound clients
+      // need accounts in their group, so auto-prefilling 'default' is the sane default)
+      const defaultG = gList.find((g: any) => g.is_default) ?? gList.find((g: any) => g.name === 'default')
+      if (defaultG) setSelectedGroupIds(new Set([defaultG.id]))
+    })
+  }, [open])
+
+  // 把策略字段拍成 payload (跟 NewAccountModal policyPayload 同样的字段集,
+  // 但 CK 导入不发 account_type — 后端用 claude.ai 自动识别的真实订阅写入 DB)
+  function policyPayload() {
+    return {
+      max_rpm: policy.max_rpm,
+      max_tpm: policy.max_tpm,
+      max_concurrent: policy.max_concurrent,
+      max_sessions: policy.max_sessions,
+      session_ttl_seconds: policy.session_ttl_seconds,
+      cooldown_seconds: policy.cooldown_seconds,
+      max_retries: policy.max_retries,
+      max_daily_req: policy.max_daily_req,
+      max_daily_tok: policy.max_daily_tok,
+      max_daily_cost: policy.max_daily_cost,
+      weight: policy.weight,
+      options,
+    }
+  }
+
+  const submitSingle = async () => {
+    setError(null); setLoading(true); setSingleResult(null)
+    try {
+      const r = await api('/admin/oauth-accounts/import-by-session-key', {
+        method: 'POST',
+        body: JSON.stringify({
+          session_key: sessionKey.trim(),
+          name: name.trim() || undefined,
+          outbound_proxy_id: singleProxyId || undefined,
+          cc_template_id: templateId || undefined,
+          group_ids: Array.from(selectedGroupIds),
+          ...policyPayload(),
+        }),
+      })
+      setSingleResult({
+        ok: true, index: 0, session_key_hint: sessionKey.slice(0, 15) + '...',
+        account: r.account,
+      })
+      onSuccess()
+    } catch (e: any) {
+      setError(e?.message || '导入失败')
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  // 实际跑批量的内部函数, 支持传入"指定一组 sk"(用于失败重试时只交付失败那几条)
+  // sessionKeysToSubmit = undefined → 从 batchKeys 文本框解析
+  async function runBatch(sessionKeysToSubmit?: string[]) {
+    setError(null); setLoading(true); setBatchSummary(null)
+    const rawList = sessionKeysToSubmit
+      ?? batchKeys.split('\n').map(s => s.trim()).filter(Boolean)
+    if (rawList.length === 0) {
+      setError('请粘贴至少一个 sessionKey')
+      setLoading(false)
+      return
+    }
+    // 输入级去重 (同 sk 在 textarea 多次粘贴) — 字符串比较, 不动后端
+    const seen = new Set<string>()
+    const sessionKeys: string[] = []
+    for (const sk of rawList) {
+      if (!seen.has(sk)) { seen.add(sk); sessionKeys.push(sk) }
+    }
+    const inputDuplicatesCount = rawList.length - sessionKeys.length
+    const proxySource: any = { mode: proxyMode }
+    if (proxyMode === 'existing') {
+      proxySource.existing_ids = Array.from(batchExistingIds)
+      if (proxySource.existing_ids.length === 0) {
+        setError('请至少勾选一个现有代理')
+        setLoading(false)
+        return
+      }
+    } else {
+      proxySource.new_proxy_urls = batchNewProxies.split('\n').map(s => s.trim()).filter(Boolean)
+      if (proxySource.new_proxy_urls.length === 0) {
+        setError('请粘贴至少一个新代理 URL')
+        setLoading(false)
+        return
+      }
+    }
+    setLastBatchKeys(sessionKeys)
+    try {
+      const r = await api('/admin/oauth-accounts/import-by-session-key/batch', {
+        method: 'POST',
+        body: JSON.stringify({
+          session_keys: sessionKeys,
+          proxy_source: proxySource,
+          accounts_per_proxy: accountsPerProxy,
+          cc_template_id: templateId || undefined,
+          name_prefix: namePrefix.trim() || undefined,
+          group_ids: Array.from(selectedGroupIds),
+          ...policyPayload(),
+        }),
+      })
+      setBatchSummary({ ...r, input_duplicates: inputDuplicatesCount })
+      if (r.ok > 0) onSuccess()
+    } catch (e: any) {
+      setError(e?.message || '批量导入失败')
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  // 公开的 submit (跟原 submitBatch 同名) — 从文本框解析
+  const submitBatch = () => runBatch()
+
+  // 失败重试 — 只把"真失败 (ok=false && !duplicate)"的 sk 重新提交,
+  // 然后把新结果 MERGE 进现有 batchSummary (按 index 映射), 不丢失之前的成功 / 重复行
+  const retryFailures = async () => {
+    if (!batchSummary || lastBatchKeys.length === 0) return
+    const failedOriginalIndices = batchSummary.results
+      .filter(r => !r.ok && !r.duplicate && isRetryableError(r.error))
+      .map(r => r.index)
+    const retryKeys = failedOriginalIndices
+      .map(i => lastBatchKeys[i])
+      .filter((s): s is string => typeof s === 'string' && s.length > 0)
+    if (retryKeys.length === 0) return
+
+    // 重建 proxySource (跟 runBatch 同源)
+    const proxySource: any = { mode: proxyMode }
+    if (proxyMode === 'existing') {
+      proxySource.existing_ids = Array.from(batchExistingIds)
+    } else {
+      proxySource.new_proxy_urls = batchNewProxies.split('\n').map(s => s.trim()).filter(Boolean)
+    }
+
+    setError(null); setLoading(true)
+    try {
+      const newResp = await api<{
+        total: number; ok: number; failed: number; duplicate?: number
+        proxy_pool_size?: number; accounts_per_proxy?: number
+        proxy_errors?: Array<{ index: number; input: string; error: string }>
+        results: BatchResult[]
+      }>('/admin/oauth-accounts/import-by-session-key/batch', {
+        method: 'POST',
+        body: JSON.stringify({
+          session_keys: retryKeys,
+          proxy_source: proxySource,
+          accounts_per_proxy: accountsPerProxy,
+          cc_template_id: templateId || undefined,
+          name_prefix: namePrefix.trim() || undefined,
+          group_ids: Array.from(selectedGroupIds),
+          ...policyPayload(),
+        }),
+      })
+
+      // MERGE: 把每个 retry 结果按 failedOriginalIndices 映射回原 batchSummary 对应行
+      setBatchSummary(prev => {
+        if (!prev) return null
+        const merged = [...prev.results]
+        newResp.results.forEach((r, retryIdx) => {
+          const originalIdx = failedOriginalIndices[retryIdx]
+          const at = merged.findIndex(orig => orig.index === originalIdx)
+          if (at >= 0) merged[at] = { ...r, index: originalIdx }
+        })
+        const ok = merged.filter(x => x.ok).length
+        const duplicate = merged.filter(x => x.duplicate).length
+        const failed = merged.length - ok - duplicate
+        return { ...prev, results: merged, ok, duplicate, failed }
+      })
+      if (newResp.ok > 0) onSuccess()
+    } catch (e: any) {
+      setError(e?.message || '失败重试出错')
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  // 用新代理重试失败的 CK — 适合 CF 拦截 / IP 黑了的情况
+  const retryWithNewProxies = async () => {
+    if (!batchSummary || lastBatchKeys.length === 0) return
+    const newProxyList = retryNewProxies.split('\n').map(s => s.trim()).filter(Boolean)
+    if (newProxyList.length === 0) {
+      setError('请粘贴至少一个新代理 URL')
+      return
+    }
+    const failedOriginalIndices = batchSummary.results
+      .filter(r => !r.ok && !r.duplicate && isRetryableError(r.error))
+      .map(r => r.index)
+    const retryKeys = failedOriginalIndices
+      .map(i => lastBatchKeys[i])
+      .filter((s): s is string => typeof s === 'string' && s.length > 0)
+    if (retryKeys.length === 0) {
+      setError('没有可重试的失败行')
+      return
+    }
+
+    setError(null); setLoading(true)
+    try {
+      const newResp = await api<{
+        total: number; ok: number; failed: number; duplicate?: number
+        proxy_pool_size?: number; accounts_per_proxy?: number
+        proxy_errors?: Array<{ index: number; input: string; error: string }>
+        results: BatchResult[]
+      }>('/admin/oauth-accounts/import-by-session-key/batch', {
+        method: 'POST',
+        body: JSON.stringify({
+          session_keys: retryKeys,
+          proxy_source: { mode: 'new', new_proxy_urls: newProxyList },
+          accounts_per_proxy: accountsPerProxy,
+          cc_template_id: templateId || undefined,
+          name_prefix: namePrefix.trim() || undefined,
+          group_ids: Array.from(selectedGroupIds),
+          ...policyPayload(),
+        }),
+      })
+
+      // MERGE 进原 batchSummary
+      setBatchSummary(prev => {
+        if (!prev) return null
+        const merged = [...prev.results]
+        newResp.results.forEach((r, retryIdx) => {
+          const originalIdx = failedOriginalIndices[retryIdx]
+          const at = merged.findIndex(orig => orig.index === originalIdx)
+          if (at >= 0) merged[at] = { ...r, index: originalIdx }
+        })
+        const ok = merged.filter(x => x.ok).length
+        const duplicate = merged.filter(x => x.duplicate).length
+        const failed = merged.length - ok - duplicate
+        return { ...prev, results: merged, ok, duplicate, failed }
+      })
+      if (newResp.ok > 0) onSuccess()
+      // 关闭代理输入区
+      setRetryProxyModalOpen(false)
+      setRetryNewProxies('')
+    } catch (e: any) {
+      setError(e?.message || '换代理重试出错')
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  // 提取健康代理: 那几条 ck 失效的(代理把请求送到 Anthropic 了,只是 ck 自己废了)
+  // → 把它们对应的 proxy_id 自动填进 existing_ids,粘新 ck 后直接复用同一组代理
+  const extractHealthyProxies = () => {
+    if (!batchSummary) return
+    const ids = Array.from(new Set(
+      batchSummary.results
+        .filter(r => !r.ok && !r.duplicate && !isRetryableError(r.error))
+        .map(r => r.proxy_id)
+        .filter((id): id is string => !!id),
+    ))
+    if (ids.length === 0) {
+      setError('没有可复用的健康代理 (本次没有 ck 失效的结果)')
+      return
+    }
+    setProxyMode('existing')
+    setBatchExistingIds(new Set(ids))
+    setBatchKeys('')
+    setError(`已选 ${ids.length} 个健康代理 — 在上方粘贴新 ck 列表后即可导入`)
+  }
+
+  const toggleExistingProxy = (id: string) => {
+    setBatchExistingIds(prev => {
+      const next = new Set(prev)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
+      return next
+    })
+  }
+
+  const canSubmitSingle = sessionKey.trim().length > 20 && templateId
+  const batchKeysCount = batchKeys.split('\n').map(s => s.trim()).filter(Boolean).length
+  const batchProxyCount = proxyMode === 'existing'
+    ? batchExistingIds.size
+    : batchNewProxies.split('\n').map(s => s.trim()).filter(Boolean).length
+  const batchCapacity = batchProxyCount * accountsPerProxy
+  const canSubmitBatch = batchKeysCount > 0 && templateId && batchProxyCount > 0
+
+  return (
+    <Modal open={open} onClose={onClose} title="导入 CK (sessionKey)" size="lg">
+      <div className="flex flex-col gap-4 p-1">
+        <Segmented
+          value={mode}
+          onChange={(v) => setMode(v as 'single' | 'batch')}
+          options={[
+            { value: 'single', label: '单个导入' },
+            { value: 'batch', label: '批量导入' },
+          ]}
+        />
+
+        {mode === 'single' ? (
+          <>
+            <Field label="sessionKey (CK)">
+              <textarea
+                className="w-full px-2 py-1.5 text-xs rounded border border-[var(--rule)] font-mono"
+                value={sessionKey}
+                onChange={e => setSessionKey(e.target.value)}
+                placeholder="sk-ant-sid02-..."
+                rows={3}
+              />
+            </Field>
+            <div className="grid grid-cols-2 gap-3">
+              <Field label="账号名(可选)">
+                <Input value={name} onChange={e => setName(e.target.value)} placeholder="留空则自动取 email" />
+              </Field>
+              <Field label="出站代理(可选)">
+                <Select value={singleProxyId} onChange={e => setSingleProxyId(e.target.value)}>
+                  <option value="">不走代理</option>
+                  {proxies.map(p => (
+                    <option key={p.id} value={p.id}>{p.name}</option>
+                  ))}
+                </Select>
+              </Field>
+            </div>
+          </>
+        ) : (
+          <>
+            {/* 第 1 区: sessionKeys */}
+            <Field label={`sessionKey 列表 (每行一个, 已识别 ${batchKeysCount} 个)`}>
+              <textarea
+                className="w-full px-2 py-1.5 text-xs rounded border border-[var(--rule)] font-mono"
+                value={batchKeys}
+                onChange={e => setBatchKeys(e.target.value)}
+                placeholder={'sk-ant-sid02-xxxxx\nsk-ant-sid02-yyyyy\nsk-ant-sid02-zzzzz'}
+                rows={6}
+              />
+            </Field>
+
+            {/* 第 2 区: 代理来源 */}
+            <div>
+              <div className="text-[11px] text-[var(--ink-3)] mb-1.5 font-mono uppercase">代理来源</div>
+              <Segmented
+                value={proxyMode}
+                onChange={(v) => setProxyMode(v as ProxyMode)}
+                options={[
+                  { value: 'existing', label: `使用现有代理 (${proxies.filter(p => (p.bound_count ?? 0) === 0).length} 未绑 / ${proxies.length} 总)` },
+                  { value: 'new', label: '手动输入新代理' },
+                ]}
+              />
+              {proxyMode === 'existing' ? (
+                <div className="mt-2 border border-[var(--rule)] rounded p-2 max-h-48 overflow-auto">
+                  {proxies.length === 0 ? (
+                    <div className="text-[12px] text-[var(--ink-3)] text-center py-4">
+                      没有现有代理. 先去 "出站代理" 页加, 或切换到 "手动输入新代理"
+                    </div>
+                  ) : (() => {
+                    const visible = onlyUnbound ? proxies.filter(p => (p.bound_count ?? 0) === 0) : proxies
+                    return (
+                      <>
+                        <label className="flex items-center gap-1.5 text-[11px] cursor-pointer mb-1.5 text-[var(--ink-2)]">
+                          <input
+                            type="checkbox"
+                            checked={onlyUnbound}
+                            onChange={(e) => setOnlyUnbound(e.target.checked)}
+                          />
+                          <span>仅显示未绑定代理 ({proxies.filter(p => (p.bound_count ?? 0) === 0).length} 个)</span>
+                        </label>
+                        <div className="grid grid-cols-2 gap-1">
+                          {visible.map(p => (
+                            <label key={p.id} className="flex items-center gap-1.5 text-[12px] cursor-pointer hover:bg-[var(--mute-bg)] px-1 py-0.5 rounded">
+                              <input
+                                type="checkbox"
+                                checked={batchExistingIds.has(p.id)}
+                                onChange={() => toggleExistingProxy(p.id)}
+                              />
+                              <span className="truncate flex-1">{p.name}</span>
+                              {(p.bound_count ?? 0) > 0 && (
+                                <span className="text-[10px] px-1 rounded bg-blue-100 text-blue-700 whitespace-nowrap">{p.bound_count}号</span>
+                              )}
+                            </label>
+                          ))}
+                        </div>
+                        <div className="mt-2 flex gap-2 text-[11px]">
+                          <button
+                            type="button"
+                            className="text-[var(--blue)] hover:underline"
+                            onClick={() => setBatchExistingIds(new Set(visible.map(p => p.id)))}
+                          >全选可见 ({visible.length})</button>
+                          <button
+                            type="button"
+                            className="text-[var(--ink-3)] hover:underline"
+                            onClick={() => setBatchExistingIds(new Set())}
+                          >清空</button>
+                          <span className="text-[var(--ink-3)] ml-auto">已选 {batchExistingIds.size}</span>
+                        </div>
+                      </>
+                    )
+                  })()}
+                </div>
+              ) : (
+                <Field label={`代理 URL 列表 (每行一个, 已识别 ${batchProxyCount} 个)`} className="mt-2">
+                  <textarea
+                    className="w-full px-2 py-1.5 text-xs rounded border border-[var(--rule)] font-mono"
+                    value={batchNewProxies}
+                    onChange={e => setBatchNewProxies(e.target.value)}
+                    placeholder={'socks5://user:pass@host:port\nhttp://user:pass@host:port\n107.173.36.187:5642:user:pass'}
+                    rows={6}
+                  />
+                </Field>
+              )}
+            </div>
+
+            {/* 第 3 区: 每代理承载数 + 模板 + 命名前缀 */}
+            <div className="grid grid-cols-3 gap-3">
+              <Field label="每代理承载账号数">
+                <Input
+                  type="number"
+                  min={1}
+                  max={100}
+                  value={accountsPerProxy}
+                  onChange={e => setAccountsPerProxy(Math.max(1, Math.min(100, Number(e.target.value) || 1)))}
+                />
+              </Field>
+              <Field label="名字前缀(可选)">
+                <Input value={namePrefix} onChange={e => setNamePrefix(e.target.value)} placeholder="留空则用 email" />
+              </Field>
+              <Field label="容量检查">
+                <div className={`px-2 py-1.5 text-xs rounded border ${batchKeysCount > batchCapacity ? 'border-[var(--err)] text-[var(--err)]' : 'border-[var(--rule)] text-[var(--ink-3)]'}`}>
+                  {batchKeysCount} 号 / {batchCapacity || '-'} 容量
+                  {batchKeysCount > batchCapacity && batchCapacity > 0 ? ' (超!)' : ''}
+                </div>
+              </Field>
+            </div>
+          </>
+        )}
+
+        {/* 所属分组 — 跟 NewAccountModal 一致, 多选 */}
+        <div>
+          <div className="text-[11px] text-[var(--ink-3)] mb-1.5 font-mono uppercase">所属分组</div>
+          <div className="border border-[var(--rule)] rounded p-2 max-h-32 overflow-auto">
+            {groups.length === 0 ? (
+              <div className="text-[12px] text-[var(--ink-3)] text-center py-2">
+                没有分组。去"账号组"页创建。
+              </div>
+            ) : (
+              <div className="grid grid-cols-2 gap-1">
+                {groups.map(g => (
+                  <label key={g.id} className="flex items-center gap-1.5 text-[12px] cursor-pointer hover:bg-[var(--mute-bg)] px-1 py-0.5 rounded">
+                    <input
+                      type="checkbox"
+                      checked={selectedGroupIds.has(g.id)}
+                      onChange={() => {
+                        setSelectedGroupIds(prev => {
+                          const next = new Set(prev)
+                          if (next.has(g.id)) next.delete(g.id)
+                          else next.add(g.id)
+                          return next
+                        })
+                      }}
+                    />
+                    <span className="truncate">{g.name}{g.is_default ? ' [默认]' : ''}</span>
+                  </label>
+                ))}
+              </div>
+            )}
+          </div>
+          <div className="text-[10px] text-[var(--ink-3)] mt-1">
+            不勾选即共享池;可勾选多个以同时归入多组。绑组 client 必须跟账号同组才能调度。
+          </div>
+        </div>
+
+        {/* 模板选择(单导/批量共用) */}
+        <Field label="HAR 伪装模板">
+          <Select value={templateId} onChange={e => setTemplateId(e.target.value)}>
+            <option value="">--- 请选择 ---</option>
+            {templates.map(t => (
+              <option key={t.id} value={t.id}>
+                {t.name} {t.is_default ? '(默认)' : ''} · 已绑 {t.used_by ?? 0} 个账号
+              </option>
+            ))}
+          </Select>
+        </Field>
+
+        {/* 策略 (单导/批量共用, 完整版镜像 NewAccountModal Step 3, 折叠) */}
+        <div className="border border-[var(--rule)] rounded">
+          <button
+            type="button"
+            className="w-full flex items-center justify-between px-3 py-2 text-[12px] font-medium text-[var(--ink-2)] hover:bg-[var(--mute-bg)] transition-colors"
+            onClick={() => setShowPolicy(!showPolicy)}
+          >
+            <span>
+              {showPolicy ? '▼' : '▶'} 策略
+              <span className="ml-2 font-mono text-[10px] text-[var(--ink-3)]">
+                (w{policy.weight} · RPM {policy.max_rpm} · TPM {policy.max_tpm} · 并发 {policy.max_concurrent})
+              </span>
+            </span>
+            <span className="font-mono text-[10px] text-[var(--ink-3)] uppercase tracking-wider">
+              {showPolicy ? '点击收起' : '默认值已填充,如需调整可直接修改'}
+            </span>
+          </button>
+          {showPolicy && (
+            <div className="border-t border-[var(--rule)] p-3 flex flex-col gap-4">
+              {/* CK 导入不显示 "账号类型" 下拉 — 订阅档位由 claude.ai 自动识别 */}
+              <div className="text-[11px] text-[var(--ink-3)] font-mono">
+                账号类型由 claude.ai 自动识别 (pro / max5 / max20 / Raven),无需手填。
+              </div>
+
+              {/* 第 1 块: 策略字段 (并发 / 速率 / 会话 / 高阶) */}
+              <AccountPolicyFields value={policy} onChange={setPolicy} compact hideAccountType />
+
+              {/* 第 2 块: 账号选项 (校验 / 清洗 / 覆盖 / 事件) — 跟 NewAccountModal 同款 */}
+              <div className="border-t border-[var(--rule)] pt-4">
+                <div className="font-mono text-[11px] uppercase tracking-wider text-[var(--ink-2)] pb-3">
+                  账号选项 (校验 / 清洗 / 覆盖 / 事件)
+                </div>
+                <AccountOptionsForm
+                  authKind="oauth"
+                  value={options}
+                  onChange={setOptions}
+                />
+              </div>
+            </div>
+          )}
+        </div>
+
+        {error && (
+          <div className="border border-[var(--err)] text-[var(--err)] p-2 text-xs rounded">
+            {error}
+          </div>
+        )}
+
+        {/* 单导结果 */}
+        {singleResult && singleResult.ok && (
+          <div className="border border-[var(--ok)] p-2 text-xs rounded">
+            ✓ 导入成功: {singleResult.account?.name} ({singleResult.account?.email}) — {singleResult.account?.plan}
+          </div>
+        )}
+
+        {/* 批量结果 */}
+        {batchSummary && (
+          <div className="border rounded p-2 text-xs space-y-1 max-h-60 overflow-auto">
+            <div className="font-semibold sticky top-0 bg-[var(--surface)] py-1 flex items-center justify-between gap-2">
+              <span>
+                <span className="text-[var(--ok)]">{batchSummary.ok} 成功</span>
+                {batchSummary.duplicate && batchSummary.duplicate > 0 ? (
+                  <> · <span className="text-[var(--warn)]">{batchSummary.duplicate} 账号重复</span></>
+                ) : null}
+                {' · '}
+                <span className="text-[var(--err)]">{batchSummary.failed} 失败</span>
+                {batchSummary.input_duplicates && batchSummary.input_duplicates > 0 ? (
+                  <> · <span className="text-[var(--ink-3)]">{batchSummary.input_duplicates} 粘贴重复(已去重)</span></>
+                ) : null}
+                {' · '}
+                代理池 {batchSummary.proxy_pool_size} 个 · 每代理 {batchSummary.accounts_per_proxy} 账号
+              </span>
+              {(() => {
+                const retryableCount = batchSummary.results.filter(
+                  r => !r.ok && !r.duplicate && isRetryableError(r.error),
+                ).length
+                const deadCount = batchSummary.results.filter(
+                  r => !r.ok && !r.duplicate && !isRetryableError(r.error),
+                ).length
+                if (retryableCount === 0 && deadCount === 0) return null
+                if (retryableCount === 0) {
+                  return (
+                    <span className="font-mono text-[10px] text-[var(--ink-3)]">
+                      死号 {deadCount} (不可重试)
+                    </span>
+                  )
+                }
+                return (
+                  <div className="flex items-center gap-1.5 flex-wrap">
+                    <Button
+                      size="sm"
+                      variant="default"
+                      disabled={loading}
+                      onClick={() => void retryFailures()}
+                      title={deadCount > 0
+                        ? `重试 ${retryableCount} 个网络/上游故障 (死号 ${deadCount} 个不重试)`
+                        : `重试 ${retryableCount} 个失败 (沿用原代理)`}
+                    >
+                      {loading ? '重试中…' : `失败重试 (${retryableCount})`}
+                    </Button>
+                    <Button
+                      size="sm"
+                      variant="default"
+                      disabled={loading}
+                      onClick={() => setRetryProxyModalOpen(v => !v)}
+                      title="换一批新代理重试 — 适合 CF 拦截 / IP 黑了的情况"
+                    >
+                      {retryProxyModalOpen ? '取消' : `换代理重试 (${retryableCount})`}
+                    </Button>
+                    {deadCount > 0 && (
+                      <Button
+                        size="sm"
+                        variant="default"
+                        disabled={loading}
+                        onClick={extractHealthyProxies}
+                        title="提取这批 ck 失效号对应的代理 (代理本身通,只是 ck 自己废了),把它们自动选进 existing_ids 复用"
+                      >
+                        复用健康代理 ({deadCount})
+                      </Button>
+                    )}
+                  </div>
+                )
+              })()}
+            </div>
+            {batchSummary.proxy_errors && batchSummary.proxy_errors.length > 0 && (
+              <div className="text-[var(--err)] py-1 border-b">
+                ⚠ 代理解析失败 {batchSummary.proxy_errors.length}:
+                {batchSummary.proxy_errors.slice(0, 3).map((e, i) => (
+                  <div key={i} className="ml-2 font-mono">- {e.input.slice(0, 40)}: {e.error}</div>
+                ))}
+              </div>
+            )}
+            {retryProxyModalOpen && (
+              <div className="border border-[var(--rule)] rounded p-2 my-2 bg-[var(--surface-2)]">
+                <div className="text-[11px] text-[var(--ink-2)] mb-1.5 font-mono uppercase">
+                  换一批新代理重试 (一行一个,自动分配给 CF 失败的号)
+                </div>
+                <textarea
+                  className="w-full px-2 py-1.5 text-xs rounded border border-[var(--rule)] font-mono"
+                  value={retryNewProxies}
+                  onChange={e => setRetryNewProxies(e.target.value)}
+                  placeholder={'socks5://user:pass@new-host:port\nhttp://user:pass@new-host:port\n1.2.3.4:443:user:pass'}
+                  rows={4}
+                  disabled={loading}
+                />
+                <div className="mt-2 flex gap-2 items-center">
+                  <Button
+                    size="sm"
+                    variant="default"
+                    disabled={loading || retryNewProxies.trim().length === 0}
+                    onClick={() => void retryWithNewProxies()}
+                  >
+                    {loading ? '重试中…' : '确认换代理重试'}
+                  </Button>
+                  <span className="text-[10px] text-[var(--ink-3)]">
+                    {retryNewProxies.split('\n').map(s => s.trim()).filter(Boolean).length} 个新代理
+                  </span>
+                </div>
+              </div>
+            )}
+            {batchSummary.results.map((r, i) => {
+              const dead = !r.ok && !r.duplicate && !isRetryableError(r.error)
+              const tone = r.ok
+                ? 'text-[var(--ok)]'
+                : r.duplicate
+                  ? 'text-[var(--warn)]'
+                  : 'text-[var(--err)]'
+              const icon = r.ok ? '✓' : r.duplicate ? '⚠' : dead ? '☠' : '✗'
+              return (
+                <div key={i} className={tone}>
+                  {icon} #{r.index + 1} {r.account?.name || r.session_key_hint}
+                  {r.ok && r.account?.plan ? ` · ${r.account.plan}` : ''}
+                  {!r.ok && r.error ? ` — ${r.error.slice(0, 80)}` : ''}
+                  {dead && <span className="ml-1 text-[var(--ink-3)]">(死号·不可重试)</span>}
+                </div>
+              )
+            })}
+          </div>
+        )}
+
+        <div className="flex justify-end gap-2 pt-2">
+          <Button variant="ghost" onClick={onClose} disabled={loading}>关闭</Button>
+          <Button
+            variant="default"
+            disabled={loading || (mode === 'single' ? !canSubmitSingle : !canSubmitBatch)}
+            onClick={() => mode === 'single' ? submitSingle() : submitBatch()}
+          >
+            {loading ? '导入中…' : `开始${mode === 'single' ? '导入' : `批量导入 (${batchKeysCount})`}`}
+          </Button>
+        </div>
+      </div>
+    </Modal>
+  )
+}

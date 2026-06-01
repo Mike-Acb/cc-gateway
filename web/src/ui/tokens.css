@@ -1,0 +1,25 @@
+@layer base {
+  :root {
+    --bg:        #faf9f5;
+    --surface:   #ffffff;
+    --ink:       #1a1a1a;
+    --ink-2:     #666666;
+    --ink-3:     #999999;
+    --rule:      #e5e2d8;
+    --rule-2:    #f2ede0;
+    --mute-bg:   #f2ede0;
+    --accent:    #c44444;
+    --ok:        #2d7a5f;
+    --warn:      #d97706;
+    --info:      #245a8a;
+    --err:       #a02020;
+    --line:        var(--rule);
+    --mute:        var(--ink-3);
+    --accent-weak: #f7e7e7;
+    --surface-2:   var(--mute-bg);
+    --font-serif: 'Instrument Serif', Georgia, serif;
+    --font-sans:  'IBM Plex Sans', -apple-system, sans-serif;
+    --font-mono:  'JetBrains Mono', 'IBM Plex Mono', ui-monospace, monospace;
+  }
+  html, body { background: var(--bg); color: var(--ink); font-family: var(--font-sans); font-size: 13px; }
+}

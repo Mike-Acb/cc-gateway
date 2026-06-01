@@ -1,0 +1,17 @@
+node_modules/
+dist/
+*.js.map
+.env
+config.yaml
+certs/
+/clients/
+.superpowers/
+.worktrees/
+.claude/
+*.tgz
+# 临时 DB 调试脚本(根目录裸 query.* 不入仓,正式脚本走 scripts/)
+/query.js
+/query.mjs
+
+ecosystem.config.cjs
+.idea

@@ -1,0 +1,14 @@
+description: "AI API identity gateway — reverse proxy that normalizes device fingerprints and telemetry for privacy-preserving API proxying"
+topics:
+  # Primary
+  - claude-code
+  - reverse-proxy
+  - privacy
+  # Secondary
+  - telemetry
+  - api-gateway
+  - fingerprint
+  # Ecosystem
+  - anthropic
+  - typescript
+  - docker

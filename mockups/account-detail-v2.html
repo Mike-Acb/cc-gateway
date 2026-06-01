@@ -1,0 +1,556 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Account Detail — Popup Views</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=DM+Sans:wght@400;500;600;700&display=swap');
+
+  :root {
+    --bg: #f5f5f7;
+    --card: #ffffff;
+    --surface: #f8f8fa;
+    --surface-hover: #f0f0f5;
+    --border: #e8e6e1;
+    --border-strong: #d4d1cb;
+    --text: #1c1917;
+    --text-2: #57534e;
+    --text-3: #a8a29e;
+    --text-4: #d6d3d1;
+    --blue: #2563eb;
+    --blue-bg: #eff6ff;
+    --green: #16a34a;
+    --green-bg: #f0fdf4;
+    --green-border: #bbf7d0;
+    --amber: #d97706;
+    --amber-bg: #fffbeb;
+    --amber-border: #fde68a;
+    --red: #dc2626;
+    --red-bg: #fef2f2;
+    --mono: 'IBM Plex Mono', monospace;
+    --sans: 'DM Sans', sans-serif;
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    background: var(--bg);
+    font-family: var(--sans);
+    color: var(--text);
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 32px 24px;
+    gap: 32px;
+  }
+
+  .section-label {
+    font-size: 13px; color: var(--text-3); font-weight: 600;
+    text-align: center; margin-bottom: 8px;
+  }
+
+  /* ═══ COMPACT CARD (existing size) ═══ */
+  .compact-card {
+    width: 520px;
+    background: var(--card);
+    border-radius: 10px;
+    border: 1px solid var(--border);
+    overflow: hidden;
+  }
+
+  .card-header {
+    display: flex; align-items: center; gap: 12px;
+    padding: 16px 20px;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .avatar {
+    width: 36px; height: 36px; border-radius: 8px; background: var(--blue);
+    display: flex; align-items: center; justify-content: center;
+    font-family: var(--mono); font-weight: 700; font-size: 15px; color: #fff;
+  }
+
+  .hdr-info { flex: 1; }
+  .hdr-name { font-weight: 700; font-size: 15px; letter-spacing: -0.2px; }
+  .hdr-meta { font-size: 11px; color: var(--text-2); margin-top: 1px; }
+  .hdr-meta code { font-family: var(--mono); font-size: 10px; color: var(--text-3); }
+
+  .badge {
+    font-size: 9px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em;
+    padding: 2px 7px; border-radius: 4px;
+  }
+  .badge-type { background: var(--blue-bg); color: var(--blue); }
+  .badge-active { background: var(--green-bg); color: var(--green); border: 1px solid var(--green-border); }
+
+  .actions-btn {
+    width: 28px; height: 28px; border-radius: 5px;
+    border: 1px solid var(--border); background: var(--card);
+    cursor: pointer; font-size: 14px; color: var(--text-3);
+    display: flex; align-items: center; justify-content: center;
+  }
+
+  /* Rings row */
+  .rings-row {
+    display: flex; justify-content: center; gap: 16px;
+    padding: 16px 20px;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .ring-cell { text-align: center; }
+  .ring-label { font-size: 10px; color: var(--text-3); font-weight: 500; margin-bottom: 5px; }
+  .ring-wrap { position: relative; width: 56px; height: 56px; }
+  .ring-wrap svg { transform: rotate(-90deg); }
+  .ring-bg { fill: none; stroke: var(--surface); stroke-width: 4.5; }
+  .ring-fg { fill: none; stroke-width: 4.5; stroke-linecap: round; }
+  .ring-pct {
+    position: absolute; inset: 0;
+    display: flex; align-items: center; justify-content: center;
+    font-family: var(--mono); font-size: 12px; font-weight: 600;
+  }
+  .ring-sub { font-family: var(--mono); font-size: 9px; color: var(--text-4); margin-top: 4px; }
+
+  /* Stats grid */
+  .stats-grid {
+    display: grid; grid-template-columns: 1fr 1fr 1fr;
+    padding: 12px 20px;
+    gap: 8px;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .stat-cell { text-align: center; }
+  .stat-label { font-size: 9px; color: var(--text-3); text-transform: uppercase; letter-spacing: 0.06em; }
+  .stat-value { font-family: var(--mono); font-size: 16px; font-weight: 600; margin-top: 1px; }
+
+  /* Realtime rows */
+  .rt-section { padding: 12px 20px; }
+  .rt-title {
+    font-size: 10px; font-weight: 600; text-transform: uppercase;
+    letter-spacing: 0.08em; color: var(--text-3); margin-bottom: 6px;
+  }
+  .rt-row {
+    display: flex; align-items: center; justify-content: space-between;
+    font-size: 12px; padding: 3px 0;
+  }
+  .rt-label { color: var(--text-2); }
+  .rt-val { font-family: var(--mono); font-weight: 500; }
+  .rt-row.clickable { cursor: pointer; border-radius: 4px; padding: 3px 4px; margin: 0 -4px; }
+  .rt-row.clickable:hover { background: var(--surface); }
+  .rt-val .arrow { font-size: 10px; color: var(--text-4); margin-left: 4px; }
+
+  /* ═══ POPUP / MODAL ═══ */
+  .popup-overlay {
+    position: fixed; inset: 0;
+    background: rgba(0,0,0,0.25);
+    display: flex; align-items: center; justify-content: center;
+    z-index: 100;
+  }
+  .popup-overlay.hidden { display: none; }
+
+  .popup {
+    background: var(--card);
+    border-radius: 12px;
+    border: 1px solid var(--border);
+    width: 560px;
+    max-height: 80vh;
+    overflow-y: auto;
+    box-shadow: 0 20px 60px rgba(0,0,0,0.15);
+  }
+
+  .popup-header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 16px 20px;
+    border-bottom: 1px solid var(--border);
+    position: sticky; top: 0; background: var(--card); z-index: 1;
+  }
+
+  .popup-title { font-weight: 700; font-size: 15px; }
+  .popup-subtitle { font-size: 11px; color: var(--text-3); margin-top: 1px; }
+
+  .close-btn {
+    width: 28px; height: 28px; border-radius: 6px;
+    border: 1px solid var(--border); background: var(--card);
+    cursor: pointer; font-size: 16px; color: var(--text-3);
+    display: flex; align-items: center; justify-content: center;
+  }
+  .close-btn:hover { background: var(--surface); }
+
+  .popup-body { padding: 16px 20px; }
+
+  /* ─── Slots popup ─── */
+  .slot-bar { display: flex; gap: 3px; height: 4px; margin-bottom: 14px; border-radius: 2px; }
+  .slot-seg { border-radius: 2px; flex: 1; }
+  .slot-seg.on { background: var(--green); }
+  .slot-seg.idle { background: var(--amber); }
+  .slot-seg.off { background: var(--border); }
+
+  .slot-row {
+    background: var(--surface); border-radius: 6px;
+    padding: 10px 12px; margin-bottom: 5px;
+    border: 1px solid transparent; cursor: pointer; transition: all 0.12s;
+  }
+  .slot-row:hover { border-color: var(--border-strong); background: var(--surface-hover); }
+
+  .slot-top { display: flex; align-items: center; gap: 8px; }
+  .slot-idx {
+    font-family: var(--mono); font-size: 10px; font-weight: 600; color: var(--text-3);
+    width: 18px; height: 18px; border-radius: 4px; border: 1px solid var(--border);
+    display: flex; align-items: center; justify-content: center; background: var(--card);
+  }
+  .slot-pip { width: 6px; height: 6px; border-radius: 50%; }
+  .slot-pip.on { background: var(--green); }
+  .slot-pip.idle { background: var(--amber); }
+  .slot-pip.off { background: var(--text-4); }
+  .slot-id {
+    font-family: var(--mono); font-size: 11px; color: var(--text-2);
+    flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .slot-time { font-family: var(--mono); font-size: 10px; color: var(--text-3); }
+  .slot-time.recent { color: var(--green); }
+
+  .slot-bottom { display: flex; align-items: center; gap: 5px; margin-top: 6px; padding-left: 26px; }
+  .client-chip {
+    font-family: var(--mono); font-size: 10px; font-weight: 500;
+    padding: 1px 6px; border-radius: 3px;
+  }
+  .client-chip.on { color: var(--green); background: var(--green-bg); border: 1px solid var(--green-border); }
+  .client-chip.idle { color: var(--amber); background: var(--amber-bg); border: 1px solid var(--amber-border); }
+  .reuse { font-family: var(--mono); font-size: 10px; color: var(--text-3); margin-left: auto; }
+  .lru-tag { font-size: 9px; font-weight: 700; text-transform: uppercase; color: var(--amber); }
+
+  .slot-row.empty { border: 1px dashed var(--border); opacity: 0.5; cursor: default; }
+  .slot-row.empty .slot-id { font-style: italic; color: var(--text-3); }
+
+  /* History timeline */
+  .history { margin-top: 10px; margin-left: 26px; border-left: 2px solid var(--border); padding-left: 12px; }
+  .history-title { font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-3); margin-bottom: 6px; }
+  .history-entry {
+    display: flex; gap: 8px; padding: 4px 0; font-size: 11px;
+    border-top: 1px solid var(--surface);
+  }
+  .history-entry:first-of-type { border-top: none; }
+  .hl-in { color: var(--green); font-weight: 600; }
+  .hl-out { color: var(--red); font-weight: 600; }
+  .client-name { font-family: var(--mono); font-weight: 600; }
+  .history-time { font-family: var(--mono); font-size: 10px; color: var(--text-3); flex-shrink: 0; margin-left: auto; }
+
+  /* ─── Disguise popup ─── */
+  .dsg-grid {
+    display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; margin-bottom: 16px;
+  }
+  .dsg-cell { background: var(--surface); border-radius: 6px; padding: 10px 12px; }
+  .dsg-cell-label { font-size: 9px; color: var(--text-3); text-transform: uppercase; letter-spacing: 0.06em; }
+  .dsg-cell-value { font-family: var(--mono); font-size: 13px; font-weight: 600; margin-top: 3px; }
+  .dsg-cell-value.sm { font-size: 11px; font-weight: 500; color: var(--text-2); }
+
+  .sub-title {
+    font-size: 10px; font-weight: 600; color: var(--text-3);
+    text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 6px;
+  }
+
+  .dsg-tools { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 16px; }
+  .dsg-tool {
+    font-family: var(--mono); font-size: 10px; padding: 2px 6px;
+    border-radius: 3px; background: var(--surface); border: 1px solid var(--border); color: var(--text-2);
+  }
+
+  .dsg-rules { margin-bottom: 16px; }
+  .dsg-rule {
+    display: flex; align-items: center; gap: 8px;
+    padding: 7px 0; font-size: 12px;
+    border-bottom: 1px solid var(--surface);
+  }
+  .dsg-rule:last-child { border-bottom: none; }
+  .dsg-rule-field { font-family: var(--mono); font-size: 11px; color: var(--text-3); width: 100px; flex-shrink: 0; }
+  .dsg-rule-desc { flex: 1; color: var(--text-2); font-size: 11px; }
+  .dsg-rule-tag {
+    font-size: 9px; font-weight: 700; padding: 2px 6px; border-radius: 3px; flex-shrink: 0;
+    letter-spacing: 0.03em;
+  }
+  .dsg-rule-tag.inject { color: var(--green); background: var(--green-bg); border: 1px solid var(--green-border); }
+  .dsg-rule-tag.floor { color: var(--amber); background: var(--amber-bg); border: 1px solid var(--amber-border); }
+  .dsg-rule-tag.pass { color: var(--text-3); background: var(--surface); border: 1px solid var(--border); }
+
+  .btn-sm {
+    font-family: var(--sans); font-size: 11px; font-weight: 600;
+    padding: 6px 14px; border-radius: 5px;
+    border: 1px solid var(--border); background: var(--card);
+    color: var(--text-2); cursor: pointer; transition: all 0.15s;
+  }
+  .btn-sm:hover { background: var(--surface); border-color: var(--border-strong); }
+  .btn-sm.danger { color: var(--red); }
+  .btn-sm.danger:hover { background: var(--red-bg); border-color: #fecaca; }
+</style>
+</head>
+<body>
+
+<!-- ════════════════════════════ -->
+<!-- COMPACT CARD (unchanged size) -->
+<!-- ════════════════════════════ -->
+<div class="section-label">账号卡片 (紧凑视图，点击行项查看详情弹窗)</div>
+
+<div class="compact-card">
+  <div class="card-header">
+    <div class="avatar">T</div>
+    <div class="hdr-info">
+      <div class="hdr-name">tiny</div>
+      <div class="hdr-meta">最后使用 <code>2m ago</code> · 数据 <code>刚刚</code>更新</div>
+    </div>
+    <span class="badge badge-type">MAX</span>
+    <span class="badge badge-active">运行中</span>
+    <button class="actions-btn">⋯</button>
+  </div>
+
+  <div class="rings-row">
+    <div class="ring-cell">
+      <div class="ring-label">5 小时</div>
+      <div class="ring-wrap">
+        <svg viewBox="0 0 56 56" width="56" height="56">
+          <circle class="ring-bg" cx="28" cy="28" r="23" />
+          <circle class="ring-fg" cx="28" cy="28" r="23" stroke="#2563eb" stroke-dasharray="144.5" stroke-dashoffset="101.2" />
+        </svg>
+        <div class="ring-pct">30%</div>
+      </div>
+      <div class="ring-sub">3时12分</div>
+    </div>
+    <div class="ring-cell">
+      <div class="ring-label">7 天</div>
+      <div class="ring-wrap">
+        <svg viewBox="0 0 56 56" width="56" height="56">
+          <circle class="ring-bg" cx="28" cy="28" r="23" />
+          <circle class="ring-fg" cx="28" cy="28" r="23" stroke="#2563eb" stroke-dasharray="144.5" stroke-dashoffset="130.1" />
+        </svg>
+        <div class="ring-pct">10%</div>
+      </div>
+      <div class="ring-sub">6天22时</div>
+    </div>
+    <div class="ring-cell">
+      <div class="ring-label">Opus 7d</div>
+      <div class="ring-wrap">
+        <svg viewBox="0 0 56 56" width="56" height="56">
+          <circle class="ring-bg" cx="28" cy="28" r="23" />
+          <circle class="ring-fg" cx="28" cy="28" r="23" stroke="#7c3aed" stroke-dasharray="144.5" stroke-dashoffset="115.6" />
+        </svg>
+        <div class="ring-pct">20%</div>
+      </div>
+      <div class="ring-sub">—</div>
+    </div>
+    <div class="ring-cell">
+      <div class="ring-label">Sonnet 7d</div>
+      <div class="ring-wrap">
+        <svg viewBox="0 0 56 56" width="56" height="56">
+          <circle class="ring-bg" cx="28" cy="28" r="23" />
+          <circle class="ring-fg" cx="28" cy="28" r="23" stroke="#16a34a" stroke-dasharray="144.5" stroke-dashoffset="137.3" />
+        </svg>
+        <div class="ring-pct">5%</div>
+      </div>
+      <div class="ring-sub">—</div>
+    </div>
+  </div>
+
+  <div class="stats-grid">
+    <div class="stat-cell">
+      <div class="stat-label">今日请求</div>
+      <div class="stat-value">347</div>
+    </div>
+    <div class="stat-cell">
+      <div class="stat-label">今日 Token</div>
+      <div class="stat-value">1.2M</div>
+    </div>
+    <div class="stat-cell">
+      <div class="stat-label">今日费用</div>
+      <div class="stat-value">$4.82</div>
+    </div>
+  </div>
+
+  <div class="rt-section">
+    <div class="rt-title">实时状态</div>
+    <div class="rt-row"><span class="rt-label">并发</span><span class="rt-val">2 / 5</span></div>
+    <div class="rt-row"><span class="rt-label">RPM</span><span class="rt-val">14 / 50</span></div>
+    <div class="rt-row"><span class="rt-label">TPM</span><span class="rt-val">33,144 / 8M</span></div>
+    <div class="rt-row clickable" onclick="document.getElementById('slots-popup').classList.remove('hidden')">
+      <span class="rt-label">Session Slots</span>
+      <span class="rt-val" style="color:var(--green)">2 / 3 <span class="arrow">▶</span></span>
+    </div>
+    <div class="rt-row clickable" onclick="document.getElementById('disguise-popup').classList.remove('hidden')">
+      <span class="rt-label">伪装模板</span>
+      <span class="rt-val" style="color:var(--green)">已学习 · 20 tools <span class="arrow">▶</span></span>
+    </div>
+  </div>
+</div>
+
+<!-- ════════════════════════════ -->
+<!-- POPUP: Session Slots -->
+<!-- ════════════════════════════ -->
+<div class="popup-overlay hidden" id="slots-popup" onclick="if(event.target===this)this.classList.add('hidden')">
+  <div class="popup">
+    <div class="popup-header">
+      <div>
+        <div class="popup-title">Session Slots</div>
+        <div class="popup-subtitle">tiny · 槽位 2 / 3</div>
+      </div>
+      <button class="close-btn" onclick="document.getElementById('slots-popup').classList.add('hidden')">×</button>
+    </div>
+    <div class="popup-body">
+      <div class="slot-bar">
+        <div class="slot-seg on"></div>
+        <div class="slot-seg idle"></div>
+        <div class="slot-seg off"></div>
+      </div>
+
+      <!-- Slot 0: active, expanded -->
+      <div class="slot-row" style="border-color:var(--border-strong);background:var(--surface-hover)">
+        <div class="slot-top">
+          <div class="slot-idx">0</div>
+          <div class="slot-pip on"></div>
+          <div class="slot-id">5aa1f225-29b3-4bed-9e97-8b88d9ba9a2d</div>
+          <div class="slot-time recent">2m ago</div>
+        </div>
+        <div class="slot-bottom">
+          <span class="client-chip on">alice</span>
+          <span class="client-chip on">my-macbook</span>
+          <span class="reuse">×4</span>
+        </div>
+        <div class="history">
+          <div class="history-title">复用记录</div>
+          <div class="history-entry">
+            <span style="flex:1"><span class="hl-in">绑定</span> <span class="client-name">my-macbook</span></span>
+            <span class="history-time">14:59</span>
+          </div>
+          <div class="history-entry">
+            <span style="flex:1"><span class="hl-in">绑定</span> <span class="client-name">alice</span> · <span class="hl-out">踢出</span> <span class="client-name">dev</span> <span style="color:var(--text-3);font-size:10px">(空闲 23m)</span></span>
+            <span class="history-time">14:30</span>
+          </div>
+          <div class="history-entry">
+            <span style="flex:1"><span class="hl-in">绑定</span> <span class="client-name">dev</span> · <span class="hl-out">踢出</span> <span class="client-name">beck</span> <span style="color:var(--text-3);font-size:10px">(空闲 41m)</span></span>
+            <span class="history-time">13:57</span>
+          </div>
+          <div class="history-entry">
+            <span style="flex:1"><span class="hl-in">创建</span> <span class="client-name">my-macbook</span></span>
+            <span class="history-time">04-14 21:49</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Slot 1: idle -->
+      <div class="slot-row">
+        <div class="slot-top">
+          <div class="slot-idx">1</div>
+          <div class="slot-pip idle"></div>
+          <div class="slot-id">bd012af9-9144-44f1-a4be-75f72f3d95c8</div>
+          <div class="slot-time">18m ago</div>
+        </div>
+        <div class="slot-bottom">
+          <span class="client-chip idle">beck-claude</span>
+          <span class="reuse">×1</span>
+          <span class="lru-tag">LRU</span>
+        </div>
+      </div>
+
+      <!-- Slot 2: empty -->
+      <div class="slot-row empty">
+        <div class="slot-top">
+          <div class="slot-idx">2</div>
+          <div class="slot-pip off"></div>
+          <div class="slot-id">— 未分配 —</div>
+          <div class="slot-time">—</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ════════════════════════════ -->
+<!-- POPUP: CC Disguise -->
+<!-- ════════════════════════════ -->
+<div class="popup-overlay hidden" id="disguise-popup" onclick="if(event.target===this)this.classList.add('hidden')">
+  <div class="popup">
+    <div class="popup-header">
+      <div>
+        <div class="popup-title">CC 伪装模板</div>
+        <div class="popup-subtitle">tiny · <span style="color:var(--green);font-weight:600">已从真实客户端学习</span></div>
+      </div>
+      <button class="close-btn" onclick="document.getElementById('disguise-popup').classList.add('hidden')">×</button>
+    </div>
+    <div class="popup-body">
+      <div class="dsg-grid">
+        <div class="dsg-cell">
+          <div class="dsg-cell-label">来源版本</div>
+          <div class="dsg-cell-value">2.1.90</div>
+        </div>
+        <div class="dsg-cell">
+          <div class="dsg-cell-label">学习时间</div>
+          <div class="dsg-cell-value sm">2 小时前</div>
+        </div>
+        <div class="dsg-cell">
+          <div class="dsg-cell-label">Tools</div>
+          <div class="dsg-cell-value">20</div>
+        </div>
+        <div class="dsg-cell">
+          <div class="dsg-cell-label">System</div>
+          <div class="dsg-cell-value">2 blocks</div>
+        </div>
+      </div>
+
+      <div class="sub-title">已学习的 Tools</div>
+      <div class="dsg-tools">
+        <span class="dsg-tool">Task</span>
+        <span class="dsg-tool">TaskOutput</span>
+        <span class="dsg-tool">Bash</span>
+        <span class="dsg-tool">Glob</span>
+        <span class="dsg-tool">Grep</span>
+        <span class="dsg-tool">Read</span>
+        <span class="dsg-tool">Edit</span>
+        <span class="dsg-tool">Write</span>
+        <span class="dsg-tool">NotebookEdit</span>
+        <span class="dsg-tool">WebFetch</span>
+        <span class="dsg-tool">WebSearch</span>
+        <span class="dsg-tool">KillShell</span>
+        <span class="dsg-tool">AskUserQuestion</span>
+        <span class="dsg-tool">Skill</span>
+        <span class="dsg-tool">EnterPlanMode</span>
+        <span class="dsg-tool">ExitPlanMode</span>
+        <span class="dsg-tool">TaskCreate</span>
+        <span class="dsg-tool">TaskGet</span>
+        <span class="dsg-tool">TaskUpdate</span>
+        <span class="dsg-tool">TaskList</span>
+      </div>
+
+      <div class="sub-title">伪装规则 (非 CC 请求自动应用)</div>
+      <div class="dsg-rules">
+        <div class="dsg-rule">
+          <span class="dsg-rule-field">tools</span>
+          <span class="dsg-rule-desc">为空时注入 20 个已学习的 tool 定义</span>
+          <span class="dsg-rule-tag inject">注入</span>
+        </div>
+        <div class="dsg-rule">
+          <span class="dsg-rule-field">thinking</span>
+          <span class="dsg-rule-desc">缺失时按模型注入 adaptive 或 enabled</span>
+          <span class="dsg-rule-tag inject">注入</span>
+        </div>
+        <div class="dsg-rule">
+          <span class="dsg-rule-field">system</span>
+          <span class="dsg-rule-desc">缺少 CC 结构时注入 2 个系统提示块</span>
+          <span class="dsg-rule-tag inject">注入</span>
+        </div>
+        <div class="dsg-rule">
+          <span class="dsg-rule-field">max_tokens</span>
+          <span class="dsg-rule-desc">&lt; 1024 时拉到模型默认值</span>
+          <span class="dsg-rule-tag floor">下限</span>
+        </div>
+        <div class="dsg-rule">
+          <span class="dsg-rule-field">messages</span>
+          <span class="dsg-rule-desc">透传，不修改</span>
+          <span class="dsg-rule-tag pass">透传</span>
+        </div>
+      </div>
+
+      <button class="btn-sm danger">清除缓存</button>
+      <span style="font-size:11px;color:var(--text-3);margin-left:10px">清除后将等待下一个 CC 客户端重新学习</span>
+    </div>
+  </div>
+</div>
+
+</body>
+</html>

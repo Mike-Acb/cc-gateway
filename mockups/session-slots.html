@@ -1,0 +1,671 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Session Slots — Account Detail</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=DM+Sans:wght@400;500;600;700&display=swap');
+
+  :root {
+    --bg-page: #f5f5f7;
+    --bg-card: #ffffff;
+    --bg-slot: #f8f8fa;
+    --bg-slot-hover: #f0f0f5;
+    --bg-expanded: #fafafe;
+    --border: #e2e2ea;
+    --border-active: #d0d0dc;
+    --text-primary: #1a1a2e;
+    --text-secondary: #6b6b80;
+    --text-dim: #9b9bae;
+    --accent-green: #16a34a;
+    --accent-green-light: #f0fdf4;
+    --accent-green-border: #bbf7d0;
+    --accent-amber: #d97706;
+    --accent-amber-light: #fffbeb;
+    --accent-amber-border: #fde68a;
+    --accent-gray: #9ca3af;
+    --accent-gray-light: #f3f4f6;
+    --accent-gray-border: #e5e7eb;
+    --accent-blue: #2563eb;
+    --accent-red: #dc2626;
+    --mono: 'IBM Plex Mono', monospace;
+    --sans: 'DM Sans', sans-serif;
+    --shadow-sm: 0 1px 2px rgba(0,0,0,0.04);
+    --shadow-card: 0 1px 4px rgba(0,0,0,0.06), 0 0 0 1px rgba(0,0,0,0.03);
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    background: var(--bg-page);
+    color: var(--text-primary);
+    font-family: var(--sans);
+    min-height: 100vh;
+    display: flex;
+    align-items: flex-start;
+    justify-content: center;
+    padding: 40px 20px;
+    gap: 24px;
+    flex-wrap: wrap;
+  }
+
+  .card {
+    width: 520px;
+    background: var(--bg-card);
+    border-radius: 10px;
+    box-shadow: var(--shadow-card);
+    overflow: hidden;
+  }
+
+  .label { font-size: 14px; color: var(--text-dim); margin-bottom: 12px; font-weight: 500; text-align: center; }
+
+  /* ── Card Header ── */
+  .card-header {
+    padding: 20px 24px 16px;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+
+  .account-badge {
+    width: 36px;
+    height: 36px;
+    border-radius: 8px;
+    background: var(--accent-blue);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-family: var(--mono);
+    font-weight: 600;
+    font-size: 14px;
+    color: #fff;
+    flex-shrink: 0;
+  }
+
+  .account-info { flex: 1; }
+
+  .account-name {
+    font-weight: 600;
+    font-size: 15px;
+    color: var(--text-primary);
+  }
+
+  .account-meta {
+    font-size: 12px;
+    color: var(--text-secondary);
+    margin-top: 2px;
+    font-family: var(--mono);
+  }
+
+  .status-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--accent-green);
+    flex-shrink: 0;
+  }
+
+  /* ── Section ── */
+  .section { padding: 20px 24px; }
+
+  .section-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 14px;
+  }
+
+  .section-title {
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--text-secondary);
+  }
+
+  .slot-counter {
+    font-family: var(--mono);
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--text-dim);
+  }
+  .slot-counter .used { color: var(--text-primary); }
+
+  /* ── Usage Bar ── */
+  .usage-bar-track {
+    width: 100%;
+    height: 4px;
+    background: var(--bg-slot);
+    border-radius: 2px;
+    margin-bottom: 16px;
+    display: flex;
+    gap: 3px;
+  }
+
+  .usage-bar-segment {
+    height: 100%;
+    border-radius: 2px;
+  }
+  .usage-bar-segment.active { background: var(--accent-green); }
+  .usage-bar-segment.idle { background: var(--accent-amber); }
+  .usage-bar-segment.empty { background: var(--border); flex: 1; }
+
+  /* ── Slot List ── */
+  .slot-list {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+
+  .slot-row {
+    background: var(--bg-slot);
+    border: 1px solid transparent;
+    border-radius: 7px;
+    padding: 12px 14px;
+    transition: all 0.15s ease;
+    cursor: pointer;
+  }
+
+  .slot-row:hover {
+    background: var(--bg-slot-hover);
+    border-color: var(--border-active);
+  }
+
+  .slot-top {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+
+  .slot-index {
+    font-family: var(--mono);
+    font-size: 10px;
+    font-weight: 600;
+    color: var(--text-dim);
+    width: 18px;
+    height: 18px;
+    border-radius: 4px;
+    border: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    background: var(--bg-card);
+  }
+
+  .slot-status-pip {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    flex-shrink: 0;
+  }
+  .slot-status-pip.active { background: var(--accent-green); }
+  .slot-status-pip.idle { background: var(--accent-amber); }
+  .slot-status-pip.empty { background: var(--accent-gray); }
+
+  .slot-session-id {
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--text-secondary);
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .slot-time {
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--text-dim);
+    flex-shrink: 0;
+  }
+  .slot-time.recent { color: var(--accent-green); }
+
+  .slot-bottom {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding-left: 28px;
+    margin-top: 8px;
+  }
+
+  .slot-tags {
+    display: flex;
+    gap: 4px;
+    flex: 1;
+    flex-wrap: wrap;
+  }
+
+  .client-tag {
+    font-family: var(--mono);
+    font-size: 10px;
+    font-weight: 500;
+    padding: 2px 7px;
+    border-radius: 3px;
+  }
+  .client-tag.active {
+    color: var(--accent-green);
+    background: var(--accent-green-light);
+    border: 1px solid var(--accent-green-border);
+  }
+  .client-tag.idle {
+    color: var(--accent-amber);
+    background: var(--accent-amber-light);
+    border: 1px solid var(--accent-amber-border);
+  }
+  .client-tag.empty {
+    color: var(--accent-gray);
+    background: var(--accent-gray-light);
+    border: 1px solid var(--accent-gray-border);
+  }
+
+  .reuse-badge {
+    font-family: var(--mono);
+    font-size: 10px;
+    color: var(--text-dim);
+    flex-shrink: 0;
+    display: flex;
+    align-items: center;
+    gap: 3px;
+  }
+
+  .lru-label {
+    font-size: 9px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--accent-amber);
+    flex-shrink: 0;
+  }
+
+  .slot-row.is-empty {
+    border: 1px dashed var(--border);
+    opacity: 0.55;
+  }
+  .slot-row.is-empty .slot-session-id {
+    color: var(--text-dim);
+    font-style: italic;
+  }
+
+  .expand-arrow {
+    font-size: 10px;
+    color: var(--text-dim);
+    flex-shrink: 0;
+    transition: transform 0.2s ease;
+  }
+  .slot-row.expanded .expand-arrow { transform: rotate(90deg); }
+
+  /* ── Expanded: Reuse History ── */
+  .slot-history {
+    margin-top: 12px;
+    margin-left: 28px;
+    border-left: 2px solid var(--border);
+    padding-left: 14px;
+  }
+
+  .history-title {
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--text-dim);
+    margin-bottom: 8px;
+  }
+
+  .history-entry {
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+    padding: 6px 0;
+    position: relative;
+  }
+
+  .history-entry + .history-entry {
+    border-top: 1px solid var(--border);
+  }
+
+  .history-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    flex-shrink: 0;
+    margin-top: 3px;
+    margin-left: -19px;
+    border: 2px solid var(--bg-card);
+  }
+  .history-dot.current { background: var(--accent-green); }
+  .history-dot.evicted { background: var(--accent-gray); }
+
+  .history-content { flex: 1; min-width: 0; }
+
+  .history-action {
+    font-size: 11px;
+    color: var(--text-primary);
+    font-weight: 500;
+  }
+  .history-action .hl-in {
+    color: var(--accent-green);
+    font-weight: 600;
+  }
+  .history-action .hl-out {
+    color: var(--accent-red);
+    font-weight: 600;
+  }
+  .history-action .client-name {
+    font-family: var(--mono);
+    font-weight: 600;
+  }
+
+  .history-detail {
+    font-family: var(--mono);
+    font-size: 10px;
+    color: var(--text-dim);
+    margin-top: 2px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .history-time {
+    font-family: var(--mono);
+    font-size: 10px;
+    color: var(--text-dim);
+    flex-shrink: 0;
+    text-align: right;
+    min-width: 60px;
+    margin-top: 2px;
+  }
+
+  /* ── Footer ── */
+  .card-footer {
+    padding: 14px 24px;
+    border-top: 1px solid var(--border);
+    display: flex;
+    gap: 24px;
+  }
+
+  .footer-stat { display: flex; flex-direction: column; gap: 2px; }
+
+  .footer-stat-label {
+    font-size: 10px;
+    color: var(--text-dim);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+  }
+
+  .footer-stat-value {
+    font-family: var(--mono);
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--text-secondary);
+  }
+</style>
+</head>
+<body>
+
+<!-- ============ 左: 收起状态 ============ -->
+<div>
+  <div class="label">Collapsed View</div>
+  <div class="card">
+    <div class="card-header">
+      <div class="account-badge">M</div>
+      <div class="account-info">
+        <div class="account-name">十三-max5</div>
+        <div class="account-meta">org e87a7a89 · max</div>
+      </div>
+      <div class="status-dot"></div>
+    </div>
+
+    <div class="section">
+      <div class="section-header">
+        <span class="section-title">Session Slots</span>
+        <span class="slot-counter"><span class="used">2</span> / 3</span>
+      </div>
+
+      <div class="usage-bar-track">
+        <div class="usage-bar-segment active" style="flex: 1;"></div>
+        <div class="usage-bar-segment idle" style="flex: 1;"></div>
+        <div class="usage-bar-segment empty"></div>
+      </div>
+
+      <div class="slot-list">
+        <!-- Slot 0: Active -->
+        <div class="slot-row">
+          <div class="slot-top">
+            <div class="slot-index">0</div>
+            <div class="slot-status-pip active"></div>
+            <div class="slot-session-id">5aa1f225-29b3-4bed-9e97-8b88d9ba9a2d</div>
+            <div class="slot-time recent">2m ago</div>
+            <div class="expand-arrow">▶</div>
+          </div>
+          <div class="slot-bottom">
+            <div class="slot-tags">
+              <span class="client-tag active">alice</span>
+              <span class="client-tag active">my-macbook</span>
+            </div>
+            <div class="reuse-badge">
+              <svg width="10" height="10" viewBox="0 0 16 16" fill="none"><path d="M13.5 8.5a5.5 5.5 0 11-1.27-3.5M13.5 2v3.5H10" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+              ×4
+            </div>
+          </div>
+        </div>
+
+        <!-- Slot 1: Idle -->
+        <div class="slot-row">
+          <div class="slot-top">
+            <div class="slot-index">1</div>
+            <div class="slot-status-pip idle"></div>
+            <div class="slot-session-id">bd012af9-9144-44f1-a4be-75f72f3d95c8</div>
+            <div class="slot-time">18m ago</div>
+            <div class="expand-arrow">▶</div>
+          </div>
+          <div class="slot-bottom">
+            <div class="slot-tags">
+              <span class="client-tag idle">beck-claude</span>
+            </div>
+            <div class="reuse-badge">
+              <svg width="10" height="10" viewBox="0 0 16 16" fill="none"><path d="M13.5 8.5a5.5 5.5 0 11-1.27-3.5M13.5 2v3.5H10" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+              ×1
+            </div>
+            <span class="lru-label">LRU</span>
+          </div>
+        </div>
+
+        <!-- Slot 2: Empty -->
+        <div class="slot-row is-empty">
+          <div class="slot-top">
+            <div class="slot-index">2</div>
+            <div class="slot-status-pip empty"></div>
+            <div class="slot-session-id">— unallocated —</div>
+            <div class="slot-time">—</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card-footer">
+      <div class="footer-stat">
+        <span class="footer-stat-label">Concurrent</span>
+        <span class="footer-stat-value">2 / 5</span>
+      </div>
+      <div class="footer-stat">
+        <span class="footer-stat-label">RPM</span>
+        <span class="footer-stat-value">14 / 60</span>
+      </div>
+      <div class="footer-stat">
+        <span class="footer-stat-label">5h Util</span>
+        <span class="footer-stat-value">0.23</span>
+      </div>
+      <div class="footer-stat">
+        <span class="footer-stat-label">Daily Req</span>
+        <span class="footer-stat-value">347</span>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ============ 右: Slot 0 展开状态 ============ -->
+<div>
+  <div class="label">Slot 0 Expanded — Reuse History</div>
+  <div class="card">
+    <div class="card-header">
+      <div class="account-badge">M</div>
+      <div class="account-info">
+        <div class="account-name">十三-max5</div>
+        <div class="account-meta">org e87a7a89 · max</div>
+      </div>
+      <div class="status-dot"></div>
+    </div>
+
+    <div class="section">
+      <div class="section-header">
+        <span class="section-title">Session Slots</span>
+        <span class="slot-counter"><span class="used">2</span> / 3</span>
+      </div>
+
+      <div class="usage-bar-track">
+        <div class="usage-bar-segment active" style="flex: 1;"></div>
+        <div class="usage-bar-segment idle" style="flex: 1;"></div>
+        <div class="usage-bar-segment empty"></div>
+      </div>
+
+      <div class="slot-list">
+        <!-- Slot 0: Expanded -->
+        <div class="slot-row expanded" style="background: var(--bg-slot-hover); border-color: var(--border-active);">
+          <div class="slot-top">
+            <div class="slot-index">0</div>
+            <div class="slot-status-pip active"></div>
+            <div class="slot-session-id">5aa1f225-29b3-4bed-9e97-8b88d9ba9a2d</div>
+            <div class="slot-time recent">2m ago</div>
+            <div class="expand-arrow">▶</div>
+          </div>
+          <div class="slot-bottom">
+            <div class="slot-tags">
+              <span class="client-tag active">alice</span>
+              <span class="client-tag active">my-macbook</span>
+            </div>
+            <div class="reuse-badge">
+              <svg width="10" height="10" viewBox="0 0 16 16" fill="none"><path d="M13.5 8.5a5.5 5.5 0 11-1.27-3.5M13.5 2v3.5H10" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+              ×4
+            </div>
+          </div>
+
+          <!-- Reuse History Timeline -->
+          <div class="slot-history">
+            <div class="history-title">Reuse History</div>
+
+            <div class="history-entry">
+              <div class="history-dot current"></div>
+              <div class="history-content">
+                <div class="history-action"><span class="hl-in">Bound</span> <span class="client-name">my-macbook</span></div>
+                <div class="history-detail">sticky: 48366ba0-df75-469d-9c65-1190ecc2647c</div>
+              </div>
+              <div class="history-time">14:59 CST</div>
+            </div>
+
+            <div class="history-entry">
+              <div class="history-dot current"></div>
+              <div class="history-content">
+                <div class="history-action"><span class="hl-in">Bound</span> <span class="client-name">alice</span> · <span class="hl-out">Evicted</span> <span class="client-name">dev</span></div>
+                <div class="history-detail">reuse #4 · dev idle 23m</div>
+              </div>
+              <div class="history-time">14:30 CST</div>
+            </div>
+
+            <div class="history-entry">
+              <div class="history-dot evicted"></div>
+              <div class="history-content">
+                <div class="history-action"><span class="hl-in">Bound</span> <span class="client-name">dev</span> · <span class="hl-out">Evicted</span> <span class="client-name">beck-claude</span></div>
+                <div class="history-detail">reuse #3 · beck-claude idle 41m</div>
+              </div>
+              <div class="history-time">13:57 CST</div>
+            </div>
+
+            <div class="history-entry">
+              <div class="history-dot evicted"></div>
+              <div class="history-content">
+                <div class="history-action"><span class="hl-in">Bound</span> <span class="client-name">beck-claude</span> · <span class="hl-out">Evicted</span> <span class="client-name">alice</span></div>
+                <div class="history-detail">reuse #2 · alice idle 1h 12m</div>
+              </div>
+              <div class="history-time">11:34 CST</div>
+            </div>
+
+            <div class="history-entry">
+              <div class="history-dot evicted"></div>
+              <div class="history-content">
+                <div class="history-action"><span class="hl-in">Bound</span> <span class="client-name">alice</span> · <span class="hl-out">Evicted</span> <span class="client-name">my-macbook</span></div>
+                <div class="history-detail">reuse #1 · my-macbook idle 2h 5m</div>
+              </div>
+              <div class="history-time">08:40 CST</div>
+            </div>
+
+            <div class="history-entry">
+              <div class="history-dot evicted"></div>
+              <div class="history-content">
+                <div class="history-action"><span class="hl-in">Created</span> · <span class="client-name">my-macbook</span></div>
+                <div class="history-detail">initial allocation</div>
+              </div>
+              <div class="history-time">04-14 21:49</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Slot 1: Collapsed -->
+        <div class="slot-row">
+          <div class="slot-top">
+            <div class="slot-index">1</div>
+            <div class="slot-status-pip idle"></div>
+            <div class="slot-session-id">bd012af9-9144-44f1-a4be-75f72f3d95c8</div>
+            <div class="slot-time">18m ago</div>
+            <div class="expand-arrow">▶</div>
+          </div>
+          <div class="slot-bottom">
+            <div class="slot-tags">
+              <span class="client-tag idle">beck-claude</span>
+            </div>
+            <div class="reuse-badge">
+              <svg width="10" height="10" viewBox="0 0 16 16" fill="none"><path d="M13.5 8.5a5.5 5.5 0 11-1.27-3.5M13.5 2v3.5H10" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+              ×1
+            </div>
+            <span class="lru-label">LRU</span>
+          </div>
+        </div>
+
+        <!-- Slot 2: Empty -->
+        <div class="slot-row is-empty">
+          <div class="slot-top">
+            <div class="slot-index">2</div>
+            <div class="slot-status-pip empty"></div>
+            <div class="slot-session-id">— unallocated —</div>
+            <div class="slot-time">—</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card-footer">
+      <div class="footer-stat">
+        <span class="footer-stat-label">Concurrent</span>
+        <span class="footer-stat-value">2 / 5</span>
+      </div>
+      <div class="footer-stat">
+        <span class="footer-stat-label">RPM</span>
+        <span class="footer-stat-value">14 / 60</span>
+      </div>
+      <div class="footer-stat">
+        <span class="footer-stat-label">5h Util</span>
+        <span class="footer-stat-value">0.23</span>
+      </div>
+      <div class="footer-stat">
+        <span class="footer-stat-label">Daily Req</span>
+        <span class="footer-stat-value">347</span>
+      </div>
+    </div>
+  </div>
+</div>
+
+</body>
+</html>
