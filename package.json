@@ -11,7 +11,7 @@
     "dev": "tsx watch src/index.ts",
     "generate-token": "tsx src/scripts/generate-token.ts",
     "generate-identity": "tsx src/scripts/generate-identity.ts",
-    "test": "tsx tests/request-shapes.test.ts && tsx tests/rewriter.test.ts && tsx tests/signature-context.test.ts && tsx tests/sync.test.ts && tsx tests/metering.test.ts && tsx tests/rate-limiter.test.ts && tsx tests/quota-checker.test.ts && tsx tests/request-logger.test.ts && tsx tests/session-slots.test.ts && tsx tests/cc-disguise.test.ts && tsx tests/features/options.test.ts && tsx tests/features/validation.test.ts && tsx tests/features/outbound-clean.test.ts && tsx tests/features/outbound-override.test.ts && tsx tests/features/cc-canonical.test.ts && tsx tests/features/build.test.ts && tsx tests/pipeline/runner.test.ts"
+    "test": "tsx tests/client-ip.test.ts && tsx tests/request-shapes.test.ts && tsx tests/rewriter.test.ts && tsx tests/signature-context.test.ts && tsx tests/sync.test.ts && tsx tests/metering.test.ts && tsx tests/rate-limiter.test.ts && tsx tests/quota-checker.test.ts && tsx tests/request-logger.test.ts && tsx tests/session-slots.test.ts && tsx tests/cc-disguise.test.ts && tsx tests/features/options.test.ts && tsx tests/features/validation.test.ts && tsx tests/features/outbound-clean.test.ts && tsx tests/features/outbound-override.test.ts && tsx tests/features/cc-canonical.test.ts && tsx tests/features/build.test.ts && tsx tests/pipeline/runner.test.ts"
   },
   "dependencies": {
     "https-proxy-agent": "^9.0.0",

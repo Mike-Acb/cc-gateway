@@ -1,5 +1,7 @@
 import { createHash } from 'crypto'
 import { log } from './logger.js'
+import { DEPLOYMENT } from './db.js'
+import { getRedis, isRedisAvailable } from './redis.js'
 
 // ── Types ──
 
@@ -17,6 +19,25 @@ export type AccountSessionTable = {
   keyToSlot: Map<string, number>
 }
 
+type SerializedSessionSlot = {
+  derivedId: string
+  lastUsed: number
+  boundKeys: string[]
+  boundClients: Array<[string, string]>
+  reuseCount: number
+  createdAt: number
+}
+
+type SerializedAccountSessionTable = {
+  slots: SerializedSessionSlot[]
+}
+
+type RedisLike = {
+  get(key: string): Promise<string | null>
+  set(key: string, value: string, ...args: any[]): Promise<unknown>
+  del(key: string): Promise<unknown>
+}
+
 export type SlotEvent = {
   accountId: string
   slotIndex: number
@@ -32,6 +53,10 @@ export type SlotEvent = {
 
 const tables = new Map<string, AccountSessionTable>()
 const listeners: Array<(event: SlotEvent) => void> = []
+let redisForTest: RedisLike | null = null
+
+const REDIS_TTL_SECONDS = 24 * 60 * 60
+const REDIS_LOCK_TTL_SECONDS = 5
 
 // ── Public API ──
 
@@ -56,16 +81,35 @@ export function deriveSessionId(accountId: string, stickyKey: string): string {
   ].join('-')
 }
 
-export function getOrAssignSession(
+export async function getOrAssignSession(
+  accountId: string,
+  stickyKey: string,
+  clientName: string,
+  maxSessions: number,
+): Promise<string> {
+  // bypass mode
+  if (maxSessions === 0) {
+    return deriveSessionId(accountId, stickyKey)
+  }
+
+  const redis = getSlotRedis()
+  if (redis) {
+    try {
+      return await getOrAssignSessionRedis(redis, accountId, stickyKey, clientName, maxSessions)
+    } catch (err) {
+      log('warn', `session-slots: redis allocation failed, falling back to memory: ${err}`)
+    }
+  }
+
+  return getOrAssignSessionMemory(accountId, stickyKey, clientName, maxSessions)
+}
+
+function getOrAssignSessionMemory(
   accountId: string,
   stickyKey: string,
   clientName: string,
   maxSessions: number,
 ): string {
-  // bypass mode
-  if (maxSessions === 0) {
-    return deriveSessionId(accountId, stickyKey)
-  }
 
   let table = tables.get(accountId)
   if (!table) {
@@ -73,6 +117,48 @@ export function getOrAssignSession(
     tables.set(accountId, table)
   }
 
+  return assignInTable(table, accountId, stickyKey, clientName, maxSessions)
+}
+
+async function getOrAssignSessionRedis(
+  redis: RedisLike,
+  accountId: string,
+  stickyKey: string,
+  clientName: string,
+  maxSessions: number,
+): Promise<string> {
+  const tableKey = redisTableKey(accountId)
+  const lockKey = redisLockKey(accountId)
+  const lockValue = `${process.pid}:${Date.now()}:${Math.random().toString(36).slice(2)}`
+
+  for (let attempt = 0; attempt < 25; attempt++) {
+    const acquired = await redis.set(lockKey, lockValue, 'EX', REDIS_LOCK_TTL_SECONDS, 'NX')
+    if (acquired) {
+      try {
+        const table = deserializeTable(await redis.get(tableKey), tables.get(accountId))
+        const derivedId = assignInTable(table, accountId, stickyKey, clientName, maxSessions)
+        await redis.set(tableKey, JSON.stringify(serializeTable(table)), 'EX', REDIS_TTL_SECONDS)
+        return derivedId
+      } finally {
+        const currentLock = await redis.get(lockKey).catch(() => null)
+        if (currentLock === lockValue) {
+          await redis.del(lockKey).catch(() => {})
+        }
+      }
+    }
+    await sleep(20)
+  }
+
+  throw new Error(`redis slot lock timeout for account ${accountId}`)
+}
+
+function assignInTable(
+  table: AccountSessionTable,
+  accountId: string,
+  stickyKey: string,
+  clientName: string,
+  maxSessions: number,
+): string {
   // Dynamic max reduction: trim excess LRU slots if maxSessions was reduced
   while (table.slots.length > maxSessions) {
     // find LRU among all slots
@@ -165,6 +251,88 @@ export function getOrAssignSession(
   return slot.derivedId
 }
 
+function getSlotRedis(): RedisLike | null {
+  if (redisForTest) return redisForTest
+  if (!isRedisAvailable()) return null
+  return getRedis()
+}
+
+function redisTableKey(accountId: string): string {
+  return `session_slots:${DEPLOYMENT}:${accountId}`
+}
+
+function redisLockKey(accountId: string): string {
+  return `session_slots_lock:${DEPLOYMENT}:${accountId}`
+}
+
+function serializeTable(table: AccountSessionTable): SerializedAccountSessionTable {
+  return {
+    slots: table.slots.map((slot) => ({
+      derivedId: slot.derivedId,
+      lastUsed: slot.lastUsed,
+      boundKeys: Array.from(slot.boundKeys),
+      boundClients: Array.from(slot.boundClients.entries()),
+      reuseCount: slot.reuseCount,
+      createdAt: slot.createdAt,
+    })),
+  }
+}
+
+function deserializeTable(raw: string | null, seed?: AccountSessionTable): AccountSessionTable {
+  if (!raw) return seed ? cloneTable(seed) : { slots: [], keyToSlot: new Map() }
+  try {
+    const parsed = JSON.parse(raw) as SerializedAccountSessionTable
+    const table: AccountSessionTable = { slots: [], keyToSlot: new Map() }
+    if (!parsed || !Array.isArray(parsed.slots)) return table
+    for (const item of parsed.slots) {
+      if (!item || typeof item.derivedId !== 'string') continue
+      const boundKeys = Array.isArray(item.boundKeys)
+        ? item.boundKeys.filter((key): key is string => typeof key === 'string')
+        : []
+      const boundClients = Array.isArray(item.boundClients)
+        ? item.boundClients.filter((entry): entry is [string, string] =>
+            Array.isArray(entry)
+            && typeof entry[0] === 'string'
+            && typeof entry[1] === 'string',
+          )
+        : []
+      const slot: SessionSlot = {
+        derivedId: item.derivedId,
+        lastUsed: Number(item.lastUsed) || Date.now(),
+        boundKeys: new Set(boundKeys),
+        boundClients: new Map(boundClients),
+        reuseCount: Number(item.reuseCount) || 0,
+        createdAt: Number(item.createdAt) || Date.now(),
+      }
+      table.slots.push(slot)
+    }
+    reindex(table)
+    return table
+  } catch {
+    return { slots: [], keyToSlot: new Map() }
+  }
+}
+
+function cloneTable(source: AccountSessionTable): AccountSessionTable {
+  const table: AccountSessionTable = { slots: [], keyToSlot: new Map() }
+  for (const slot of source.slots) {
+    table.slots.push({
+      derivedId: slot.derivedId,
+      lastUsed: slot.lastUsed,
+      boundKeys: new Set(slot.boundKeys),
+      boundClients: new Map(slot.boundClients),
+      reuseCount: slot.reuseCount,
+      createdAt: slot.createdAt,
+    })
+  }
+  reindex(table)
+  return table
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms))
+}
+
 function findSlotIndexByClient(table: AccountSessionTable, clientName: string): number {
   for (let i = 0; i < table.slots.length; i++) {
     if ([...table.slots[i].boundClients.values()].includes(clientName)) {
@@ -194,6 +362,10 @@ export function getAllSessionTables(): Map<string, AccountSessionTable> {
 
 export function resetSessionTables(): void {
   tables.clear()
+}
+
+export function setSessionSlotRedisForTest(redis: RedisLike | null): void {
+  redisForTest = redis
 }
 
 export function hydrateFromRows(rows: Array<{

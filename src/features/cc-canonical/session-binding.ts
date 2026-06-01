@@ -7,8 +7,8 @@ export const ccSessionBinding: Feature = {
   id: 'cc-session-binding',
   phase: 'outbound-canonical',
   appliesTo: isMessagesNotCountTokens,
-  run(ctx: PipelineContext) {
-    const id = getOrAssignSession(
+  async run(ctx: PipelineContext) {
+    const id = await getOrAssignSession(
       ctx.account.id, ctx.sessionKey, ctx.clientName,
       ctx.account.maxSessions ?? 0,
     ) || deriveFallbackSessionId(ctx.account.canonicalIdentity?.account_uuid ?? ctx.account.id)

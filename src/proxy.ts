@@ -75,6 +75,7 @@ import {
   noteSuccessfulSignatureContext,
   shouldStripSignatureBlocksForContext,
 } from './signature-context.js'
+import { resolveClientIp } from './client-ip.js'
 
 // Cache for resolving config.yaml client names to PG client IDs
 const configClientIdCache = new Map<string, string>()
@@ -449,7 +450,10 @@ async function handleRequest(
 ) {
   const method = req.method || 'GET'
   const path = req.url || '/'
-  const clientIp = req.socket.remoteAddress || 'unknown'
+  const clientIp = resolveClientIp(
+    req.socket.remoteAddress,
+    req.headers as Record<string, string | string[] | undefined>,
+  )
   const traceId = generateTraceId()
   const debugLogging = shouldLog('debug')
   // Inbound headers are ALWAYS logged (not gated on debug) so admin log
@@ -615,7 +619,7 @@ async function handleRequest(
     res.end(JSON.stringify({ error: 'Unauthorized - provide client token via x-api-key header' }))
     const providedKey = req.headers['x-api-key'] as string | undefined
     const keyHint = providedKey ? `key="${providedKey.slice(0, 8)}…" (${providedKey.length} chars)` : 'no x-api-key header'
-    log('warn', `Unauthorized request: ${method} ${path} [${keyHint}] from ${req.socket.remoteAddress}`)
+    log('warn', `Unauthorized request: ${method} ${path} [${keyHint}] from ${clientIp}`)
     // Log unauthorized requests directly (logEarlyExit closure depends on
     // authResult which is null here, so inline a minimal insert).
     // Await insert before update — same serialization rule as logEarlyExit.
@@ -1355,7 +1359,7 @@ async function applyRewrite(
       // invariant broke and the resulting empty session-id + fallback uuid
       // mismatch leaked into the outbound to Anthropic.
       const derivedSessionId =
-        getOrAssignSession(
+        await getOrAssignSession(
           account.account.id, stickyKey,
           clientName ?? 'unknown',
           account.account.maxSessions,
@@ -1426,7 +1430,7 @@ async function applyRewrite(
       if (profile) {
         rewriteOpts = {
           profile,
-          derivedSessionId: getOrAssignSession('single-token', stickyKey, 'single-token', 0),
+          derivedSessionId: await getOrAssignSession('single-token', stickyKey, 'single-token', 0),
           inboundUserAgent: inboundUA,
           inboundClientIp: clientIp,
           requestShapeIn,
@@ -1561,7 +1565,10 @@ async function forwardToUpstream(
     ?? (req.headers['x-claude-code-session-id'] as string | undefined)
     ?? extractStickyId(bodyUserId)
     ?? (authResult.clientId ?? authResult.clientName)
-  const clientIp = req.socket.remoteAddress || 'unknown'
+  const clientIp = resolveClientIp(
+    req.socket.remoteAddress,
+    req.headers as Record<string, string | string[] | undefined>,
+  )
   let body: Buffer
   let headers: Record<string, string>
   let toolNameReverseMap: Map<string, string> | null = null
@@ -1741,7 +1748,7 @@ async function forwardToUpstream(
       // Falls back to the canonical account UUID-derived per-hour session id
       // when no stickyKey can be extracted (rare but observed in ban traces).
       const derivedSessId = stickyKey
-        ? (getOrAssignSession(
+        ? (await getOrAssignSession(
             selectedAccount.account.id, stickyKey,
             clientName,
             selectedAccount.account.maxSessions,
