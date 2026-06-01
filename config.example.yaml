@@ -22,16 +22,18 @@ server:
 # PostgreSQL database (optional — enables usage metering, rate limits, quotas)
 # If omitted, the gateway runs in config.yaml-only mode
 database:
-  host: localhost
+  # Use "localhost" when running the gateway directly on the host.
+  host: postgres
   port: 5432
   database: cc_gateway
   user: cc_gateway
-  password: change-me
-  max_connections: 10
+  password: change-me-password
+  max_connections: 15
 
 # Redis (optional — enables multi-account OAuth pool with sticky sessions)
 redis:
-  host: 127.0.0.1
+  # Use "127.0.0.1" when running the gateway directly on the host.
+  host: redis
   port: 6379
   # password: your-redis-password
 

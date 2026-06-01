@@ -176,7 +176,37 @@ After setup, add more clients with:
 ```bash
 bash scripts/add-client.sh <name>
 # Restart to pick up new tokens:
-docker compose restart
+docker compose -f docker-compose.yml restart
+```
+
+### Docker Compose dependencies
+
+The compose files include a fresh PostgreSQL 15 service, Redis 7 service,
+gateway service, and API server on port `3000`.
+PostgreSQL creates the `cc_gateway` database and applies `migrations/*.sql`
+on the first initialization of the `postgres_data` volume.
+
+When the gateway itself runs in Compose, set these hosts in `config.yaml`:
+
+```yaml
+database:
+  host: postgres
+  port: 5432
+  database: cc_gateway
+  user: cc_gateway
+  password: change-me-password
+
+redis:
+  host: redis
+  port: 6379
+```
+
+By default PostgreSQL, Redis, and the API server bind to localhost on `5432`,
+`6379`, and `3000`.
+Override the host ports if the machine already has local services running:
+
+```bash
+POSTGRES_PORT=15432 REDIS_PORT=16379 SERVER_PORT=13000 docker compose -f docker-compose.yml up -d --build
 ```
 
 ### Multi-machine deployment

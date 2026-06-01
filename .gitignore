@@ -4,6 +4,7 @@ dist/
 .env
 config.yaml
 certs/
+logs/
 /clients/
 .superpowers/
 .worktrees/

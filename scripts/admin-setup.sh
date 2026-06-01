@@ -6,12 +6,16 @@ set -e
 cd "$(dirname "$0")/.."
 
 CONFIG="config.yaml"
+DOCKER_AVAILABLE=false
+if command -v docker &>/dev/null && docker info &>/dev/null 2>&1; then
+  DOCKER_AVAILABLE=true
+fi
 
 # ── If config exists, just start ──
 if [[ -f "$CONFIG" ]]; then
   echo "config.yaml exists. Starting gateway..."
-  if command -v docker &>/dev/null && docker info &>/dev/null 2>&1; then
-    docker compose up -d --build
+  if [[ "$DOCKER_AVAILABLE" == "true" ]]; then
+    docker compose -f docker-compose.yml up -d --build
   else
     echo "Docker not available, starting with Node..."
     npm run build && npm start
@@ -96,6 +100,22 @@ fi
 
 GATEWAY_URL="${GATEWAY_SCHEME}://${GATEWAY_HOST}:${GATEWAY_PORT}"
 
+DATA_SERVICES_CONFIG=""
+if [[ "$DOCKER_AVAILABLE" == "true" ]]; then
+  DATA_SERVICES_CONFIG="
+database:
+  host: postgres
+  port: 5432
+  database: cc_gateway
+  user: cc_gateway
+  password: change-me-password
+  max_connections: 15
+
+redis:
+  host: redis
+  port: 6379"
+fi
+
 # ── 5. Generate identity + admin token ──
 DEVICE_ID=$(openssl rand -hex 32)
 ADMIN_TOKEN=$(openssl rand -hex 32)
@@ -106,6 +126,7 @@ echo "✓ Device ID: ${DEVICE_ID:0:8}..."
 cat > "$CONFIG" <<YAML
 server:
   port: ${GATEWAY_PORT}${TLS_CONFIG}
+${DATA_SERVICES_CONFIG}
 
 upstream:
   url: https://api.anthropic.com
@@ -167,8 +188,8 @@ echo ""
 
 # ── 8. Start gateway ──
 echo "Starting gateway..."
-if command -v docker &>/dev/null && docker info &>/dev/null 2>&1; then
-  if docker compose up -d --build 2>&1; then
+if [[ "$DOCKER_AVAILABLE" == "true" ]]; then
+  if docker compose -f docker-compose.yml up -d --build 2>&1; then
     echo "✓ Gateway running (Docker): ${GATEWAY_URL}"
   else
     echo ""

@@ -1,3 +1,30 @@
+name: cc-gateway-lb
+
+x-gateway-common: &gateway-common
+  build: .
+  restart: unless-stopped
+  expose:
+    - "18443"
+  volumes:
+    - ./config.yaml:/app/config.yaml:ro
+  command:
+    - /bin/sh
+    - -lc
+    - mkdir -p /var/log/cc-gateway && exec node dist/index.js /app/config.yaml >> /var/log/cc-gateway/gateway.log 2>&1
+  healthcheck:
+    test:
+      - CMD-SHELL
+      - node -e "fetch('http://localhost:18443/_health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+    interval: 30s
+    timeout: 5s
+    retries: 3
+    start_period: 15s
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+
 services:
   postgres:
     image: postgres:15
@@ -12,7 +39,9 @@ services:
       - postgres_data:/var/lib/postgresql/data
       - ./migrations:/docker-entrypoint-initdb.d:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      test:
+        - CMD-SHELL
+        - pg_isready -h 127.0.0.1 -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"
       interval: 10s
       timeout: 5s
       retries: 5
@@ -37,7 +66,9 @@ services:
     volumes:
       - redis_data:/data
     healthcheck:
-      test: ["CMD-SHELL", "if [ -n \"$${REDIS_PASSWORD}\" ]; then redis-cli -a \"$${REDIS_PASSWORD}\" ping; else redis-cli ping; fi"]
+      test:
+        - CMD-SHELL
+        - if [ -n "$${REDIS_PASSWORD}" ]; then redis-cli -a "$${REDIS_PASSWORD}" ping; else redis-cli ping; fi
       interval: 10s
       timeout: 5s
       retries: 5
@@ -48,8 +79,8 @@ services:
         max-size: "10m"
         max-file: "3"
 
-  gateway:
-    build: .
+  gateway-1:
+    <<: *gateway-common
     depends_on:
       postgres:
         condition: service_healthy
@@ -58,19 +89,67 @@ services:
     environment:
       NODE_ENV: production
       DEPLOYMENT: ${DEPLOYMENT:-gw}
-      PORT: 8443
+      PORT: 18443
       SKIP_BOOT_REFRESH: ${SKIP_BOOT_REFRESH:-0}
-    ports:
-      - "8443:8443"
     volumes:
       - ./config.yaml:/app/config.yaml:ro
-      - ./certs:/app/certs:ro
+      - ./logs/gateway-1:/var/log/cc-gateway
+
+  gateway-2:
+    <<: *gateway-common
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      DEPLOYMENT: ${DEPLOYMENT:-gw}
+      PORT: 18443
+      SKIP_BOOT_REFRESH: ${SKIP_BOOT_REFRESH:-0}
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+      - ./logs/gateway-2:/var/log/cc-gateway
+
+  gateway-3:
+    <<: *gateway-common
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      DEPLOYMENT: ${DEPLOYMENT:-gw}
+      PORT: 18443
+      SKIP_BOOT_REFRESH: ${SKIP_BOOT_REFRESH:-0}
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+      - ./logs/gateway-3:/var/log/cc-gateway
+
+  nginx:
+    image: nginx:1.27-alpine
     restart: unless-stopped
+    depends_on:
+      gateway-1:
+        condition: service_healthy
+      gateway-2:
+        condition: service_healthy
+      gateway-3:
+        condition: service_healthy
+    ports:
+      - "18443:18443"
+    volumes:
+      - ./nginx/gateway-lb.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./logs/nginx:/var/log/nginx
     healthcheck:
-      test: ["CMD", "node", "-e", "fetch('http://localhost:8443/_health').then(r=>{process.exit(r.ok?0:1)}).catch(()=>process.exit(1))"]
+      test:
+        - CMD-SHELL
+        - wget -q --spider http://127.0.0.1:18443/_health || exit 1
       interval: 30s
       timeout: 5s
       retries: 3
+      start_period: 10s
     logging:
       driver: json-file
       options:
@@ -81,12 +160,13 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.server
+    restart: unless-stopped
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
-      gateway:
+      nginx:
         condition: service_healthy
     environment:
       NODE_ENV: production
@@ -105,16 +185,19 @@ services:
       JWT_REFRESH_SECRET: ${JWT_REFRESH_SECRET:-cc-gateway-refresh-secret-change-me}
       CORS_ORIGIN: ${CORS_ORIGIN:-http://localhost:5173}
       APP_URL: ${APP_URL:-http://localhost:5173}
-      GATEWAY_HEALTH_URL: ${GATEWAY_HEALTH_URL:-http://gateway:8443/_health}
-      GATEWAY_RELOAD_URL: ${GATEWAY_RELOAD_URL:-http://gateway:8443/_reload}
-      GATEWAY_INTERNAL_URL: ${GATEWAY_INTERNAL_URL:-http://gateway:8443}
+      GATEWAY_HEALTH_URL: ${GATEWAY_HEALTH_URL:-http://nginx:18443/_health}
+      GATEWAY_RELOAD_URL: ${GATEWAY_RELOAD_URL:-http://nginx:18443/_reload}
+      GATEWAY_INTERNAL_URL: ${GATEWAY_INTERNAL_URL:-http://nginx:18443}
       NODE_TLS_REJECT_UNAUTHORIZED: ${NODE_TLS_REJECT_UNAUTHORIZED:-0}
       CURL_IMPERSONATE_BIN: ${CURL_IMPERSONATE_BIN:-/usr/local/bin/curl_chrome145}
     ports:
       - "${SERVER_BIND:-127.0.0.1}:${SERVER_PORT:-3000}:3000"
-    restart: unless-stopped
     healthcheck:
-      test: ["CMD", "node", "-e", "fetch('http://localhost:3000/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      test:
+        - CMD
+        - node
+        - -e
+        - fetch('http://localhost:3000/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))
       interval: 30s
       timeout: 5s
       retries: 3
