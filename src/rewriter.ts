@@ -421,7 +421,7 @@ export async function rewriteBody(
  *   3. cch = (hash & 0xFFFFF) formatted as 05x
  *   4. replace "00000" in-place
  */
-function injectCCHAttestation(body: Buffer<ArrayBuffer>): Buffer<ArrayBuffer> {
+function injectCCHAttestation(body: Buffer): Buffer {
   if (!xxh64Fn) {
     log('warn', 'xxhash-wasm not ready, skipping CCH attestation')
     return body

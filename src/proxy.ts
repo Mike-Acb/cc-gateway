@@ -476,9 +476,12 @@ async function handleRequest(
     const poolConfigured = isPoolConfigured()
     const poolActive = isPoolEnabled()
     const singleTokenOk = !!getSingleUpstreamToken(config)
-    const healthy = poolConfigured ? poolActive : singleTokenOk
+    const pollModeWaiting = config.database && isAccountPoolPollMode(config) && !poolActive
+    const healthy = pollModeWaiting ? true : (poolConfigured ? poolActive : singleTokenOk)
     const status = healthy ? 200 : 503
-    const detail = poolConfigured
+    const detail = pollModeWaiting
+      ? 'ACCOUNT_POOL_MODE=poll — gateway is running and waiting for DB accounts.'
+      : poolConfigured
       ? await describePoolUnavailability(null)
       : (singleTokenOk
           ? (getUpstreamAuthMode(config) === 'static_bearer'
@@ -490,12 +493,16 @@ async function handleRequest(
     res.writeHead(status, { 'Content-Type': 'application/json' })
     res.end(JSON.stringify({
       status: healthy ? 'ok' : 'degraded',
-      oauth: poolConfigured
+      oauth: pollModeWaiting
+        ? 'waiting-for-accounts'
+        : poolConfigured
         ? (poolActive ? 'pool-active' : 'pool-unavailable')
         : (getUpstreamAuthMode(config) === 'static_bearer'
             ? (singleTokenOk ? 'static-bearer' : 'missing-static-bearer')
             : (singleTokenOk ? 'valid' : 'expired/refreshing')),
-      pool: poolConfigured ? (poolActive ? 'active' : 'unavailable') : 'not-configured',
+      pool: pollModeWaiting
+        ? 'waiting-for-accounts'
+        : poolConfigured ? (poolActive ? 'active' : 'unavailable') : 'not-configured',
       detail,
       default_profile: getDefaultProfile()?.name ?? null,
       upstream: config.upstream.url,
