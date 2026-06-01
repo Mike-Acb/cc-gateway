@@ -300,7 +300,7 @@ requestLogsRouter.get('/', async (req, res) => {
         params,
       )
       const hasMore = result.rows.length > limit
-      const items = result.rows.slice(0, limit).map(({ total_count: _totalCount, ...row }) => row)
+      const items = result.rows.slice(0, limit).map(({ total_count: _totalCount, ...row }: any) => row)
       const nextCursor = hasMore && items.length > 0
         ? { createdAt: items[items.length - 1].created_at, id: items[items.length - 1].id }
         : null
@@ -349,7 +349,7 @@ requestLogsRouter.get('/', async (req, res) => {
       params,
     )
 
-    const items = result.rows.map(({ total_count: _totalCount, ...row }) => row)
+    const items = result.rows.map(({ total_count: _totalCount, ...row }: any) => row)
     res.json({
       logs: items,
       items,

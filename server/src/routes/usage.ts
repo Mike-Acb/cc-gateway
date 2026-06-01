@@ -154,13 +154,13 @@ router.get('/summary', async (req, res) => {
       total_cache_read: num(row.total_cache_read),
       total_cache_write: num(row.total_cache_write),
       total_cost: num(row.total_cost),
-      by_model: byModel.rows.map(r => ({
+      by_model: byModel.rows.map((r: any) => ({
         model: r.model,
         input_tokens: num(r.input_tokens),
         output_tokens: num(r.output_tokens),
         cost: num(r.cost),
       })),
-      by_client: byClient.rows.map(r => ({
+      by_client: byClient.rows.map((r: any) => ({
         client_id: r.client_id,
         client_name: r.client_name,
         status: r.client_status,
@@ -329,7 +329,7 @@ router.get('/records', async (req, res) => {
     )
 
     res.json({
-      data: result.rows.map(r => ({
+      data: result.rows.map((r: any) => ({
         id: r.id,
         client_id: r.client_id,
         client_name: r.client_name,
@@ -436,7 +436,7 @@ adminRouter.get('/ranking', async (req, res) => {
     )
 
     res.json({
-      rankings: result.rows.map(r => ({
+      rankings: result.rows.map((r: any) => ({
         user_id: r.user_id,
         username: r.username,
         total_tokens: num(r.total_tokens),

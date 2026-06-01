@@ -153,7 +153,7 @@ router.get('/pool-status', rateLimit, async (_req: Request, res: Response) => {
     }> = []
 
     // Bulk fetch redis state per account
-    const accountIds = accountsResult.rows.map((r) => r.id)
+    const accountIds = accountsResult.rows.map((r: any) => r.id)
     const cooldownMap = new Map<string, boolean>()
     const rpmMap = new Map<string, number>()
     const util5hMap = new Map<string, number | null>()

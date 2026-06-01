@@ -10,7 +10,7 @@ const pool = new Pool({
   max: Number(process.env.DB_MAX_CONNECTIONS ?? 10),
 })
 
-pool.on('error', (err) => {
+pool.on('error', (err: Error) => {
   console.error('Unexpected PG pool error:', err.message)
 })
 
