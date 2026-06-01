@@ -394,7 +394,7 @@ export async function rewriteBody(
     rewriteGenericIdentity(parsed, view)
   }
 
-  let buf = Buffer.from(JSON.stringify(parsed), 'utf-8')
+  let buf: Buffer = Buffer.from(JSON.stringify(parsed), 'utf-8')
 
   // Post-serialization: compute xxhash64 attestation and replace cch=00000.
   // 真 CC 2.1.130 之前不计算 cch(总是占位符 00000),之后才启用 attestation。
