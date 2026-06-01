@@ -50,6 +50,10 @@ upstream:
 # Upstream auth mode
 # - oauth_refresh: use oauth.refresh_token to maintain an upstream Bearer token
 # - static_bearer: send a fixed upstream Bearer token directly (for example ANTHROPIC_AUTH_TOKEN)
+# In Docker Compose the gateway defaults to ACCOUNT_POOL_MODE=poll, so it can
+# start with an empty DB and wait for accounts imported from the admin UI.
+# In that mode the oauth block below may be omitted unless you want legacy
+# config.yaml single-token fallback outside the DB pool.
 # upstream_auth:
 #   mode: static_bearer
 #   bearer_token: "sk-your-upstream-bearer-token"

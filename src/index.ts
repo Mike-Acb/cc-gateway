@@ -1,4 +1,4 @@
-import { loadConfig, getUpstreamAuthMode, setConfig } from './config.js'
+import { loadConfig, getUpstreamAuthMode, isAccountPoolPollMode, setConfig } from './config.js'
 import { setLogLevel, log } from './logger.js'
 
 // Prevent uncaught errors in async callbacks (event emitter, logging)
@@ -93,10 +93,13 @@ try {
   }
 
   const upstreamAuthMode = getUpstreamAuthMode(config)
+  const accountPoolPollMode = isAccountPoolPollMode(config)
 
   // Only initialize single-token OAuth as fallback if no account pool is configured
-  if (!poolStarted && upstreamAuthMode === 'oauth_refresh') {
+  if (!poolStarted && upstreamAuthMode === 'oauth_refresh' && !accountPoolPollMode) {
     await initOAuth(config.oauth!, resolvedConfigPath)
+  } else if (!poolStarted && accountPoolPollMode) {
+    log('info', 'ACCOUNT_POOL_MODE=poll — starting without config.yaml single-token OAuth; waiting for DB accounts')
   } else if (!poolStarted) {
     log('info', 'upstream_auth.mode=static_bearer — skipping single-token OAuth init')
   } else {

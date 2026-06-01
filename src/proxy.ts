@@ -5,7 +5,7 @@ import { readFileSync } from 'fs'
 import { request as httpsRequest } from 'https'
 import { URL } from 'url'
 import type { Config } from './config.js'
-import { getUpstreamAuthMode } from './config.js'
+import { getUpstreamAuthMode, isAccountPoolPollMode } from './config.js'
 import { authenticate, initAuth, type AuthResult } from './auth.js'
 import { getAccessToken } from './oauth.js'
 import { rewriteBody, rewriteHeaders, getLockedVersion, deriveFallbackSessionId, type RewriteOptions } from './rewriter.js'
@@ -1013,6 +1013,23 @@ async function handleRequest(
     }))
     await logEarlyExit(503, { error: detail }, detail)
     log('error', detail)
+    return
+  }
+
+  if (
+    config.database
+    && isAccountPoolPollMode(config)
+    && getUpstreamAuthMode(config) === 'oauth_refresh'
+    && !selectedAccount
+  ) {
+    const detail = 'No OAuth accounts in pool; gateway is running in ACCOUNT_POOL_MODE=poll and waiting for DB accounts'
+    res.writeHead(503, { 'Content-Type': 'application/json' })
+    res.end(JSON.stringify({
+      error: 'No available OAuth accounts in pool',
+      detail,
+    }))
+    await logEarlyExit(503, { error: detail }, detail, null, null, 'pool_empty', 'gw')
+    log('warn', detail)
     return
   }
 

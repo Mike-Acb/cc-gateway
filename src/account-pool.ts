@@ -8,6 +8,7 @@ import { onSlotEvent, hydrateFromRows, type SlotEvent } from './session-slots.js
 import { assertAccountTemplatesPresent, hasTemplateInRedis, syncTemplatesToRedis } from './cc-disguise.js'
 import { getClientGroupId, getGroupMultiplier } from './sync.js'
 import { decodeOptions, type AccountOptions } from './features/options.js'
+import { isAccountPoolPollMode } from './config.js'
 
 // Types
 export type CanonicalIdentity = {
@@ -1769,6 +1770,9 @@ function ensurePoolTimers(): void {
         .map(a => a.canonicalIdentity?.account_uuid)
         .filter((u): u is string => !!u)
       if (uuids.length > 0) hydrateVersionLocks(uuids).catch(() => {})
+      if (!poolEnabled || accounts.length === 0) {
+        await enablePoolIfReady().catch(() => {})
+      }
     }, 30_000)
   }
 
@@ -1791,9 +1795,12 @@ async function enablePoolIfReady(): Promise<void> {
     } else if (poolConfigured) {
       log('warn', 'account-pool: configured accounts exist but none are active; pool disabled')
     } else {
-      log('info', 'account-pool: no accounts in DB, pool disabled (using config.yaml single token)')
+      log('info', isAccountPoolPollMode()
+        ? 'account-pool: no accounts in DB, waiting in poll mode'
+        : 'account-pool: no accounts in DB, pool disabled (using config.yaml single token)')
     }
     poolEnabled = false
+    if (isAccountPoolPollMode()) ensurePoolTimers()
     return
   }
 

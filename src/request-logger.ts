@@ -92,6 +92,7 @@ export type BlockReason =
   | 'no_cc_template'
   | 'heartbeat_ok'
   | 'heartbeat_pool_empty'
+  | 'pool_empty'
 
 export type BlockSource = 'gw' | 'up'
 

@@ -8,6 +8,7 @@ export type TokenEntry = {
 }
 
 export type UpstreamAuthMode = 'oauth_refresh' | 'static_bearer'
+export type AccountPoolMode = 'fallback' | 'poll'
 
 export type Config = {
   server: {
@@ -78,6 +79,14 @@ export function getUpstreamAuthMode(config: Config): UpstreamAuthMode {
   return config.upstream_auth?.mode ?? 'oauth_refresh'
 }
 
+export function getAccountPoolMode(): AccountPoolMode {
+  return process.env.ACCOUNT_POOL_MODE === 'poll' ? 'poll' : 'fallback'
+}
+
+export function isAccountPoolPollMode(config?: Config): boolean {
+  return getAccountPoolMode() === 'poll' && (!config || !!config.database)
+}
+
 export function loadConfig(configPath?: string): Config {
   const filePath = configPath || resolve(process.cwd(), 'config.yaml')
   const raw = readFileSync(filePath, 'utf-8')
@@ -91,7 +100,7 @@ export function loadConfig(configPath?: string): Config {
     if (!config.upstream_auth?.bearer_token?.trim()) {
       throw new Error('config: upstream_auth.bearer_token is required when upstream_auth.mode=static_bearer')
     }
-  } else if (!config.oauth?.refresh_token) {
+  } else if (!config.oauth?.refresh_token && !isAccountPoolPollMode(config)) {
     throw new Error('config: oauth.refresh_token is required when upstream_auth.mode=oauth_refresh. Do a browser OAuth login on the admin machine, then copy the refresh token from ~/.claude/.credentials.json')
   }
 

@@ -91,6 +91,7 @@ services:
       NODE_ENV: production
       DEPLOYMENT: ${DEPLOYMENT:-gw}
       PORT: 8443
+      ACCOUNT_POOL_MODE: ${ACCOUNT_POOL_MODE:-poll}
       SKIP_BOOT_REFRESH: ${SKIP_BOOT_REFRESH:-0}
     ports:
       - "8443:8443"
