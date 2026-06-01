@@ -1,6 +1,6 @@
 -- Session slot management: limits outbound session_id count per OAuth account
 
-CREATE TABLE session_slots (
+CREATE TABLE IF NOT EXISTS session_slots (
   id                 BIGSERIAL PRIMARY KEY,
   account_id         UUID NOT NULL REFERENCES oauth_accounts(id) ON DELETE CASCADE,
   slot_index         SMALLINT NOT NULL,
@@ -11,9 +11,9 @@ CREATE TABLE session_slots (
   created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
   UNIQUE(account_id, slot_index)
 );
-CREATE INDEX idx_session_slots_account ON session_slots(account_id);
+CREATE INDEX IF NOT EXISTS idx_session_slots_account ON session_slots(account_id);
 
-CREATE TABLE session_slot_history (
+CREATE TABLE IF NOT EXISTS session_slot_history (
   id                 BIGSERIAL PRIMARY KEY,
   account_id         UUID NOT NULL REFERENCES oauth_accounts(id) ON DELETE CASCADE,
   slot_index         SMALLINT NOT NULL,
@@ -24,7 +24,7 @@ CREATE TABLE session_slot_history (
   reuse_number       INT,
   created_at         TIMESTAMPTZ NOT NULL DEFAULT now()
 );
-CREATE INDEX idx_slot_history_account ON session_slot_history(account_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_slot_history_account ON session_slot_history(account_id, created_at DESC);
 
 -- Change default max_sessions from 0 (unlimited) to 3
 ALTER TABLE oauth_accounts ALTER COLUMN max_sessions SET DEFAULT 3;

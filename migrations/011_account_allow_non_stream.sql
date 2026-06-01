@@ -3,4 +3,4 @@
 -- fingerprint anomaly. Default FALSE blocks non-stream requests at the gateway.
 
 ALTER TABLE oauth_accounts
-  ADD COLUMN allow_non_stream BOOLEAN NOT NULL DEFAULT FALSE;
+  ADD COLUMN IF NOT EXISTS allow_non_stream BOOLEAN NOT NULL DEFAULT FALSE;

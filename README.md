@@ -182,9 +182,8 @@ docker compose -f docker-compose.yml restart
 ### Docker Compose dependencies
 
 The compose files include a fresh PostgreSQL 15 service, Redis 7 service,
-gateway service, and API server on port `3000`.
-PostgreSQL creates the `cc_gateway` database and applies `migrations/*.sql`
-on the first initialization of the `postgres_data` volume.
+a one-shot migration service, gateway service, and API server on port `3000`.
+The `migrate` service applies `migrations/*.sql` before gateway and API startup.
 
 When the gateway itself runs in Compose, set these hosts in `config.yaml`:
 

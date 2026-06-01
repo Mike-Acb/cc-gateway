@@ -63,6 +63,9 @@ ALTER TABLE oauth_accounts
 
 -- 5) 加 options shape CHECK
 ALTER TABLE oauth_accounts
+  DROP CONSTRAINT IF EXISTS oauth_accounts_options_shape_check;
+
+ALTER TABLE oauth_accounts
   ADD CONSTRAINT oauth_accounts_options_shape_check
   CHECK (
     jsonb_typeof(options->'validate') = 'object'

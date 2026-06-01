@@ -29,6 +29,8 @@ DELETE FROM cc_disguise_templates WHERE source = 'learned';
 --    with source='learned' are already deleted above.
 ALTER TABLE cc_disguise_templates DROP CONSTRAINT IF EXISTS cc_disguise_templates_source_check;
 ALTER TABLE cc_disguise_templates
+  DROP CONSTRAINT IF EXISTS cc_disguise_templates_source_check_v2;
+ALTER TABLE cc_disguise_templates
   ADD CONSTRAINT cc_disguise_templates_source_check
   CHECK (source IN ('manual', 'cloned', 'imported'));
 

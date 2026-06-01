@@ -10,7 +10,6 @@ services:
       - "${POSTGRES_BIND:-127.0.0.1}:${POSTGRES_PORT:-5432}:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      - ./migrations:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
       interval: 10s
@@ -48,13 +47,46 @@ services:
         max-size: "10m"
         max-file: "3"
 
+  migrate:
+    image: postgres:15
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGHOST: postgres
+      PGPORT: 5432
+      PGDATABASE: ${POSTGRES_DB:-cc_gateway}
+      PGUSER: ${POSTGRES_USER:-cc_gateway}
+      PGPASSWORD: ${POSTGRES_PASSWORD:-change-me-password}
+    volumes:
+      - ./migrations:/migrations:ro
+    command:
+      - /bin/sh
+      - -ec
+      - |
+        psql -v ON_ERROR_STOP=1 -c 'CREATE TABLE IF NOT EXISTS schema_migrations (filename TEXT PRIMARY KEY, applied_at TIMESTAMPTZ NOT NULL DEFAULT now())'
+        for f in /migrations/*.sql; do
+          name="$$(basename "$$f")"
+          if [ "$$(psql -tAc "SELECT 1 FROM schema_migrations WHERE filename = '$$name'")" = "1" ]; then
+            echo "skip $$name"
+            continue
+          fi
+          echo "apply $$name"
+          psql -v ON_ERROR_STOP=1 -f "$$f"
+          psql -v ON_ERROR_STOP=1 -c "INSERT INTO schema_migrations (filename) VALUES ('$$name') ON CONFLICT DO NOTHING"
+        done
+    restart: "no"
+
   gateway:
     build: .
+    image: ghcr.io/mike-acb/cc-gateway:latest
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     environment:
       NODE_ENV: production
       DEPLOYMENT: ${DEPLOYMENT:-gw}
@@ -63,7 +95,12 @@ services:
     ports:
       - "8443:8443"
     volumes:
-      - ./config.yaml:/app/config.yaml:ro
+      - type: bind
+        source: ./config.yaml
+        target: /app/config.yaml
+        read_only: true
+        bind:
+          create_host_path: false
       - ./certs:/app/certs:ro
     restart: unless-stopped
     healthcheck:
@@ -81,11 +118,14 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.server
+    image: ghcr.io/mike-acb/cc-gateway-server:latest
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
       gateway:
         condition: service_healthy
     environment:

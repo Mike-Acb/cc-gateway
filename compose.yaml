@@ -4,9 +4,14 @@ x-gateway-common: &gateway-common
   build: .
   restart: unless-stopped
   expose:
-    - "18443"
+    - "8443"
   volumes:
-    - ./config.yaml:/app/config.yaml:ro
+    - type: bind
+      source: ./config.yaml
+      target: /app/config.yaml
+      read_only: true
+      bind:
+        create_host_path: false
   command:
     - /bin/sh
     - -lc
@@ -14,7 +19,7 @@ x-gateway-common: &gateway-common
   healthcheck:
     test:
       - CMD-SHELL
-      - node -e "fetch('http://localhost:18443/_health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+      - node -e "fetch('http://localhost:8443/_health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
     interval: 30s
     timeout: 5s
     retries: 3
@@ -37,7 +42,6 @@ services:
       - "${POSTGRES_BIND:-127.0.0.1}:${POSTGRES_PORT:-5432}:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      - ./migrations:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test:
         - CMD-SHELL
@@ -79,6 +83,36 @@ services:
         max-size: "10m"
         max-file: "3"
 
+  migrate:
+    image: postgres:15
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGHOST: postgres
+      PGPORT: 5432
+      PGDATABASE: ${POSTGRES_DB:-cc_gateway}
+      PGUSER: ${POSTGRES_USER:-cc_gateway}
+      PGPASSWORD: ${POSTGRES_PASSWORD:-change-me-password}
+    volumes:
+      - ./migrations:/migrations:ro
+    command:
+      - /bin/sh
+      - -ec
+      - |
+        psql -v ON_ERROR_STOP=1 -c 'CREATE TABLE IF NOT EXISTS schema_migrations (filename TEXT PRIMARY KEY, applied_at TIMESTAMPTZ NOT NULL DEFAULT now())'
+        for f in /migrations/*.sql; do
+          name="$$(basename "$$f")"
+          if [ "$$(psql -tAc "SELECT 1 FROM schema_migrations WHERE filename = '$$name'")" = "1" ]; then
+            echo "skip $$name"
+            continue
+          fi
+          echo "apply $$name"
+          psql -v ON_ERROR_STOP=1 -f "$$f"
+          psql -v ON_ERROR_STOP=1 -c "INSERT INTO schema_migrations (filename) VALUES ('$$name') ON CONFLICT DO NOTHING"
+        done
+    restart: "no"
+
   gateway-1:
     <<: *gateway-common
     depends_on:
@@ -86,13 +120,20 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     environment:
       NODE_ENV: production
       DEPLOYMENT: ${DEPLOYMENT:-gw}
-      PORT: 18443
+      PORT: 8443
       SKIP_BOOT_REFRESH: ${SKIP_BOOT_REFRESH:-0}
     volumes:
-      - ./config.yaml:/app/config.yaml:ro
+      - type: bind
+        source: ./config.yaml
+        target: /app/config.yaml
+        read_only: true
+        bind:
+          create_host_path: false
       - ./logs/gateway-1:/var/log/cc-gateway
 
   gateway-2:
@@ -102,13 +143,20 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     environment:
       NODE_ENV: production
       DEPLOYMENT: ${DEPLOYMENT:-gw}
-      PORT: 18443
+      PORT: 8443
       SKIP_BOOT_REFRESH: ${SKIP_BOOT_REFRESH:-0}
     volumes:
-      - ./config.yaml:/app/config.yaml:ro
+      - type: bind
+        source: ./config.yaml
+        target: /app/config.yaml
+        read_only: true
+        bind:
+          create_host_path: false
       - ./logs/gateway-2:/var/log/cc-gateway
 
   gateway-3:
@@ -118,13 +166,20 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     environment:
       NODE_ENV: production
       DEPLOYMENT: ${DEPLOYMENT:-gw}
-      PORT: 18443
+      PORT: 8443
       SKIP_BOOT_REFRESH: ${SKIP_BOOT_REFRESH:-0}
     volumes:
-      - ./config.yaml:/app/config.yaml:ro
+      - type: bind
+        source: ./config.yaml
+        target: /app/config.yaml
+        read_only: true
+        bind:
+          create_host_path: false
       - ./logs/gateway-3:/var/log/cc-gateway
 
   nginx:
@@ -166,6 +221,8 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
       nginx:
         condition: service_healthy
     environment:
